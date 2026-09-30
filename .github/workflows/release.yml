@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (empty = project version from CMakeLists.txt)
+        required: false
+        default: ''
+      arm64:
+        description: Also build and attach an ARM64 package
+        type: boolean
+        default: false
+      prerelease:
+        description: Mark the release as a pre-release
+        type: boolean
+        default: false
+      draft:
+        description: Create the release as a draft
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${INPUT_VERSION#v}"
+          if [ -z "$version" ]; then
+            version=$(sed -nE 's/^project\(dgmod VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)
+          fi
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version '$version'"
+            exit 1
+          fi
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "::error::Release v$version already exists"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Select targets
+        id: matrix
+        run: |
+          if [ "${{ inputs.arm64 }}" = "true" ]; then
+            echo 'matrix=[{"arch":"x64","preset":"x64-release","msvc":"amd64"},{"arch":"arm64","preset":"arm64-release","msvc":"amd64_arm64"}]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix=[{"arch":"x64","preset":"x64-release","msvc":"amd64"}]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: windows-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PACKAGE: dgmod-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "build/${{ matrix.preset }}"
+          $stage = "package/$env:PACKAGE"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "$out/dgmod.exe", "$out/dgmod-bridge.exe", README.md $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "package/$env:PACKAGE.zip" -CompressionLevel Optimal
+          $pdb = "package/$env:PACKAGE-symbols"
+          New-Item -ItemType Directory -Force $pdb | Out-Null
+          Copy-Item "$out/dgmod.pdb", "$out/dgmod-bridge.pdb" $pdb
+          Compress-Archive -Path "$pdb/*" -DestinationPath "package/$env:PACKAGE-symbols.zip" -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: package/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          flags=()
+          [ "${{ inputs.prerelease }}" = "true" ] && flags+=(--prerelease)
+          [ "${{ inputs.draft }}" = "true" ] && flags+=(--draft)
+          (cd dist && sha256sum *.zip > SHA256SUMS.txt)
+          gh release create "v$VERSION" dist/*.zip dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "dgmod $VERSION" \
+            --generate-notes \
+            "${flags[@]}"
