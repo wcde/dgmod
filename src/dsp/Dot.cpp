@@ -194,6 +194,21 @@ DotKernels KernelsFor(SimdLevel level) {
     return Make(level);
 }
 
+bool CpuHasAvx512() {
+#if DGMOD_X86
+    static const bool has = [] {
+        if (!CpuHasAvx2Fma()) return false;
+        if ((_xgetbv(0) & 0xE6) != 0xE6) return false;  // XMM, YMM, opmask and both ZMM parts
+        int info[4]{};
+        __cpuidex(info, 7, 0);
+        return (info[1] & (1 << 16)) != 0;
+    }();
+    return has;
+#else
+    return false;
+#endif
+}
+
 const wchar_t* SimdLevelName(SimdLevel level) {
     switch (level) {
         case SimdLevel::Avx2: return L"AVX2+FMA";

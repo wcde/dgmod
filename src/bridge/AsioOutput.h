@@ -8,7 +8,8 @@
 // outputReady() runs on a private STA thread owned by this class. The driver calls bufferSwitch() on its own thread.
 //
 // Click protection: the render thread works QueueDepth() buffers ahead of the driver. It pushes finished buffers into
-// a small queue, each with an emergency continuation (the same stream faded out to DSD silence); the callback only
+// a small queue, each with an emergency continuation (the same stream faded out to DSD silence, possibly attached a
+// little later by another thread); the callback only
 // copies the oldest one into the driver's half and wakes the render thread (SwitchEvent), so it never waits and a
 // late render thread has QueueDepth() periods of slack instead of none. If the queue is empty all the same, the callback
 // plays the emergency continuation of the buffer it played last, then DSD silence, and advances the epoch: buffers the
@@ -91,13 +92,18 @@ public:
     [[nodiscard]] uint64_t Epoch() const { return epoch_.load(std::memory_order_acquire); }
     // Queues one period (`frames` DSD words per channel, `channels` interleaved) and its emergency continuation.
     // Returns false (nothing queued) if the epoch is no longer `epoch`: the buffer would not join what was played.
-    bool Push(const uint16_t* words, const uint16_t* emergency, uint32_t channels, uint64_t epoch);
+    // `emergency` may be null: it is then attached later with SetEmergency(*seq, ...), from any thread, before the next
+    // Push. Until then the slot has no continuation: a dry queue right after it plays DSD silence instead.
+    bool Push(const uint16_t* words, const uint16_t* emergency, uint32_t channels, uint64_t epoch, uint64_t* seq = nullptr);
+    void SetEmergency(uint64_t seq, const uint16_t* emergency, uint32_t channels);
 
     // Any thread.
     [[nodiscard]] HANDLE ResetEvent() const { return resetEvent_.Get(); }  // the driver asked to be re-opened
     [[nodiscard]] std::wstring ResetReason() const;
     // Buffer switches that found no queued buffer after playback had begun (covered by a fade-out to silence).
     [[nodiscard]] uint64_t LateSwitches() const { return late_.load(std::memory_order_relaxed); }
+    // Of those, the ones whose emergency continuation was not attached yet (cut to DSD silence).
+    [[nodiscard]] uint64_t MissingEmergencies() const { return missing_.load(std::memory_order_relaxed); }
     [[nodiscard]] uint64_t Overloads() const { return overloads_.load(std::memory_order_relaxed); }
     // Mean interval of the buffer switches since Start (0 until enough were seen), in seconds.
     [[nodiscard]] double MeasuredSwitchSec() const;
@@ -138,10 +144,11 @@ private:
     mutable std::mutex queueMutex_;  // held for a few microseconds by either side
     uint64_t head_ = 0, tail_ = 0;
     bool emergencyReady_ = false;  // slot tail_ - 1 was played and its emergency continuation not yet
+    std::array<uint64_t, kSlots> emergencySeq_{};  // per slot: the push whose continuation it holds (~0 = none)
     std::atomic<uint64_t> epoch_{0};
 
     UniqueHandle switchEvent_, resetEvent_;
-    std::atomic<uint64_t> switchSeq_{0}, late_{0}, overloads_{0};
+    std::atomic<uint64_t> switchSeq_{0}, late_{0}, missing_{0}, overloads_{0};
     std::atomic<int64_t> firstSwitchQpc_{0}, lastSwitchQpc_{0};
     std::atomic<uint64_t> timedSwitches_{0};
     double qpcFreq_ = 1;

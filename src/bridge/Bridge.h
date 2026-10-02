@@ -30,6 +30,8 @@
 
 namespace dgmod::bridge {
 
+class DsdJobThread;
+
 class BridgeEngine {
 public:
     // Runs until `stopEvent` is signaled. `reloadEvent` (auto-reset) restarts the pipeline if the configuration changed.
@@ -65,8 +67,15 @@ private:
     // the modulator for DoP and native DSD (queued for the ASIO driver). Returns the number of clipped samples. `out`
     // may be modified.
     uint64_t WritePeriod(std::vector<float>& out, BYTE* data);
-    // Native DSD: modulates one period (scaled PCM) and queues it with its emergency fade-out.
+    // Native DSD, at the start of a period: modulates its held head (the last fadeFrames_ frames of the period before)
+    // on the head thread while the render thread runs the DSP chain.
+    void BeginNative();
+    // Native DSD: modulates the rest of the period (scaled PCM), queues it and has its emergency fade-out rendered on
+    // the spare thread (attached to the queued buffer when done).
     void QueueNative(const std::vector<float>& out);
+    void FillHead();  // modPcm_ head: the held frames with the fade-in gain
+    [[nodiscard]] float FadeIn(uint64_t p) const;
+    [[nodiscard]] float FadeOut(uint32_t k) const;
     // Idle period: digital silence, or modulated silence for DSD (a DoP DAC must keep receiving DoP markers).
     void WriteIdle(std::vector<float>& out, BYTE* data);
     // Replaces non-finite output samples by silence and resets the stateful stages that produced them.
@@ -114,6 +123,13 @@ private:
     dsp::DsdEncoder dsdSpare_;
     std::vector<float> holdPcm_, modPcm_, emergencyPcm_;
     std::vector<uint16_t> emergencyWords_;
+    // Worker threads of the render thread (alive while it runs): the head of each period, and the emergency fade-out
+    // of the period queued last (spareSeq_, spareTail_ frames).
+    DsdJobThread* headJob_ = nullptr;
+    DsdJobThread* spareJob_ = nullptr;
+    bool headPending_ = false;  // BeginNative started the head of the period being rendered
+    uint64_t spareSeq_ = 0;
+    uint32_t spareTail_ = 0;
     bool asioChecked_ = false; // main thread: the switch interval was checked this session
     std::wstring asioTimingError_;  // the driver's buffers do not match their declared size: native DSD is refused
     dsp::DsdEncoder dsd_;
@@ -150,7 +166,7 @@ private:
     // Last counter values reported to the log (main thread).
     struct GlitchSnapshot {
         uint64_t underruns = 0, resyncs = 0, overruns = 0, discontinuities = 0, modulatorResets = 0, late = 0, slow = 0;
-        uint64_t badSamples = 0, lateSwitches = 0;
+        uint64_t badSamples = 0, lateSwitches = 0, missingEmergencies = 0;
     } logged_;
     uint64_t sessionMaxWakeGap_ = 0;
     void LogGlitches();

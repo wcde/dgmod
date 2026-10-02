@@ -242,12 +242,13 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
     qpcFreq_ = double(f.QuadPart);
     switchEvent_.Reset(::CreateEventW(nullptr, FALSE, FALSE, nullptr));
     resetEvent_.Reset(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    switchSeq_ = late_ = overloads_ = timedSwitches_ = 0;
+    switchSeq_ = late_ = missing_ = overloads_ = timedSwitches_ = 0;
     firstSwitchQpc_ = lastSwitchQpc_ = 0;
     {
         std::lock_guard lock(queueMutex_);
         head_ = tail_ = 0;
         emergencyReady_ = false;
+        emergencySeq_.fill(~uint64_t{0});
         epoch_ = 0;
     }
     {
@@ -481,15 +482,17 @@ uint32_t AsioDsdOutput::Queued() const {
     return static_cast<uint32_t>(head_ - tail_);
 }
 
-bool AsioDsdOutput::Push(const uint16_t* words, const uint16_t* emergency, uint32_t channels, uint64_t epoch) {
+bool AsioDsdOutput::Push(const uint16_t* words, const uint16_t* emergency, uint32_t channels, uint64_t epoch,
+                         uint64_t* seq) {
     uint64_t slot = 0;
     {
         std::lock_guard lock(queueMutex_);
         if (head_ - tail_ >= depth_ || slots_.empty()) return false;
         slot = head_;
+        emergencySeq_[slot % kSlots] = ~uint64_t{0};
     }
     // Slot head_ is neither queued nor the last played one, so the callback does not read it meanwhile.
-    for (int e = 0; e < 2; ++e) {
+    for (int e = 0; e < (emergency ? 2 : 1); ++e) {
         uint8_t* dst = Slot(slot, e == 1);
         for (uint32_t c = 0; c < opened_.channels; ++c)
             PackDsdChannel(e ? emergency : words, opened_.frames, channels, std::min(c, channels - 1), opened_.lsbFirst,
@@ -497,8 +500,21 @@ bool AsioDsdOutput::Push(const uint16_t* words, const uint16_t* emergency, uint3
     }
     std::lock_guard lock(queueMutex_);
     if (epoch_.load(std::memory_order_relaxed) != epoch) return false;
+    if (emergency) emergencySeq_[slot % kSlots] = slot;
+    if (seq) *seq = slot;
     ++head_;
     return true;
+}
+
+void AsioDsdOutput::SetEmergency(uint64_t seq, const uint16_t* emergency, uint32_t channels) {
+    // The callback reads a slot's continuation only once it is marked, and the slot is not reused before the next
+    // Push, so it is packed without the lock.
+    uint8_t* dst = Slot(seq, true);
+    for (uint32_t c = 0; c < opened_.channels; ++c)
+        PackDsdChannel(emergency, opened_.frames, channels, std::min(c, channels - 1), opened_.lsbFirst,
+                       dst + size_t(c) * bytesPerBuffer_);
+    std::lock_guard lock(queueMutex_);
+    emergencySeq_[seq % kSlots] = seq;
 }
 
 void AsioDsdOutput::CopySlot(const uint8_t* src, long index) {
@@ -544,9 +560,11 @@ void AsioDsdOutput::OnSwitch(long index) {
         } else {
             // Nothing ready: never replay the stale half. The stream of the buffer played last fades out to silence,
             // and whatever the render thread built on the old stream is refused.
-            if (emergencyReady_) CopySlot(Slot(tail_ - 1, true), index);
+            const bool attached = emergencyReady_ && emergencySeq_[(tail_ - 1) % kSlots] == tail_ - 1;
+            if (attached) CopySlot(Slot(tail_ - 1, true), index);
             else FillSilence(index);
             if (emergencyReady_) late_.fetch_add(1, std::memory_order_relaxed);
+            if (emergencyReady_ && !attached) missing_.fetch_add(1, std::memory_order_relaxed);
             emergencyReady_ = false;
             epoch_.fetch_add(1, std::memory_order_release);
         }

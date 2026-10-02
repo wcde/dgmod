@@ -10,7 +10,11 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <functional>
 #include <limits>
+#include <optional>
+#include <semaphore>
+#include <thread>
 #include <vector>
 
 namespace dgmod::bridge {
@@ -99,6 +103,50 @@ private:
 };
 
 }  // namespace
+
+// A Pro Audio thread that runs one fixed job at a time for the render thread: Run starts it, Wait returns once it is
+// done (the render thread waits before the next Run and before touching what the job uses).
+class DsdJobThread {
+public:
+    DsdJobThread(const wchar_t* name, std::function<void()> job)
+        : name_(name), job_(std::move(job)), thread_([this] { Loop(); }) {}
+    ~DsdJobThread() {
+        Wait();
+        quit_ = true;
+        start_.release();
+        thread_.join();
+    }
+    DsdJobThread(const DsdJobThread&) = delete;
+    DsdJobThread& operator=(const DsdJobThread&) = delete;
+
+    void Run() {
+        busy_ = true;
+        start_.release();
+    }
+    void Wait() {
+        if (!busy_) return;
+        done_.acquire();
+        busy_ = false;
+    }
+
+private:
+    void Loop() {
+        ::SetThreadDescription(::GetCurrentThread(), name_);
+        MmcssScope mmcss;
+        for (;;) {
+            start_.acquire();
+            if (quit_) return;
+            job_();
+            done_.release();
+        }
+    }
+
+    const wchar_t* name_;
+    std::function<void()> job_;
+    std::binary_semaphore start_{0}, done_{0};
+    bool quit_ = false, busy_ = false;
+    std::thread thread_;  // last: starts once the rest is set up
+};
 
 void BridgeEngine::SetState(BridgeState s, const std::wstring& message) {
     state_.store(s);
@@ -371,7 +419,8 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
         const dsp::LookAheadShape la = dsd_.LookAheadUsed();
         dsp += std::format(L", {} DSD{} ({} Hz, modulator order {}{}, noise shaped to {:.0f} kHz, {} % level)",
                            dop_ ? L"DoP" : L"native", dsd_.DsdRate() / 44100, dsd_.DsdRate(), dsd_.Ntf().order,
-                           la.paths ? std::format(L", look-ahead {} paths x {} bits", la.paths, la.depth)
+                           la.paths ? std::format(L", look-ahead {} paths x {} bits{}", la.paths, la.depth,
+                                                  dsd_.LookAheadAvx512() ? L" (AVX-512)" : L"")
                            : cfg.dsdLookAhead != dsp::LookAhead::Off ? std::wstring(L", look-ahead off above DSD256")
                                                                      : std::wstring(),
                            dsd_.NoiseBandHz() / 1000.0, std::lround(dsdScale_ * 100.0f));
@@ -843,6 +892,28 @@ void BridgeEngine::RenderThread() {
             ::SetEvent(drainedEvent_.Get());
     };
     bool again = native_;  // native DSD: render the next period without waiting (the queue has room)
+    // Native DSD worker threads; on exit the spare job still running attaches its fade-out before the thread ends.
+    struct NativeJobs {
+        BridgeEngine* engine;
+        std::optional<DsdJobThread> head, spare;
+        ~NativeJobs() {
+            spare.reset();
+            head.reset();
+            engine->headJob_ = engine->spareJob_ = nullptr;
+            engine->headPending_ = false;
+        }
+    } jobs{this};
+    if (native_) {
+        jobs.head.emplace(L"dgmod bridge dsd head",
+                          [this] { dsd_.Process(modPcm_.data(), fadeFrames_, dsdWords_.data()); });
+        jobs.spare.emplace(L"dgmod bridge dsd spare", [this] {
+            dsdSpare_.Process(emergencyPcm_.data(), spareTail_, emergencyWords_.data());
+            std::fill(emergencyWords_.begin() + size_t(spareTail_) * channels_, emergencyWords_.end(), uint16_t{0x6969});
+            asio_.SetEmergency(spareSeq_, emergencyWords_.data(), channels_);
+        });
+        headJob_ = &*jobs.head;
+        spareJob_ = &*jobs.spare;
+    }
     for (;;) {
         if (!again) {
             HANDLE handles[] = {quitEvent_.Get(), native_ ? asio_.SwitchEvent() : renderEvent_.Get()};
@@ -882,6 +953,8 @@ void BridgeEngine::RenderThread() {
             Fail(L"Output lost: " + HResultText(hr));
             return;
         }
+        // Native DSD: every period from here on is queued (WritePeriod); its held head is modulated meanwhile.
+        if (native_) BeginNative();
         if (toneDirty_.load(std::memory_order_acquire)) {
             std::unique_lock lock(toneMutex_, std::try_to_lock);  // never wait on the main thread
             if (lock.owns_lock()) {
@@ -1002,7 +1075,7 @@ void BridgeEngine::RenderThread() {
 void BridgeEngine::LogGlitches() {
     const GlitchSnapshot now{underruns_.load(),       resyncs_.load(),     overruns_.load(),    discontinuities_.load(),
                              modulatorResets_.load(), lateWakeups_.load(), slowPeriods_.load(), badSamples_.load(),
-                             native_ ? asio_.LateSwitches() : 0};
+                             native_ ? asio_.LateSwitches() : 0,          native_ ? asio_.MissingEmergencies() : 0};
     auto delta = [](const wchar_t* name, uint64_t a, uint64_t b) {
         return a > b ? std::format(L" {} +{}", name, a - b) : std::wstring();
     };
@@ -1013,7 +1086,8 @@ void BridgeEngine::LogGlitches() {
                         delta(L"late render wake-ups", now.late, logged_.late) +
                         delta(L"slow periods", now.slow, logged_.slow) +
                         delta(L"invalid samples replaced", now.badSamples, logged_.badSamples) +
-                        delta(L"ASIO buffers missed", now.lateSwitches, logged_.lateSwitches);
+                        delta(L"ASIO buffers missed", now.lateSwitches, logged_.lateSwitches) +
+                        delta(L"of them without a fade-out", now.missingEmergencies, logged_.missingEmergencies);
     if (what.empty()) return;
     logged_ = now;
     Log(std::format(L"glitch:{} (longest wake-up gap {:.1f} ms, period {:.1f} ms, fifo {:.1f} ms)", what,
@@ -1047,48 +1121,88 @@ uint64_t BridgeEngine::WritePeriod(std::vector<float>& out, BYTE* data) {
     return clipped;
 }
 
+// Raised-cosine gains: fade-in at position p after a restart, fade-out at k.
+float BridgeEngine::FadeIn(uint64_t p) const {
+    constexpr double kPi = 3.14159265358979323846;
+    return p < fadeFrames_ ? float(0.5 - 0.5 * std::cos(kPi * double(p + 1) / (fadeFrames_ + 1))) : 1.0f;
+}
+
+float BridgeEngine::FadeOut(uint32_t k) const {
+    constexpr double kPi = 3.14159265358979323846;
+    return k < fadeFrames_ ? float(0.5 + 0.5 * std::cos(kPi * (k + 1) / (fadeFrames_ + 1))) : 0.0f;
+}
+
+void BridgeEngine::FillHead() {
+    const uint32_t ch = channels_;
+    const bool fading = fadeInPos_ < fadeFrames_;
+    for (uint32_t i = 0; i < fadeFrames_; ++i) {
+        const float g = fading ? FadeIn(uint64_t(fadeInPos_) + i) : 1.0f;
+        for (uint32_t c = 0; c < ch; ++c) modPcm_[size_t(i) * ch + c] = holdPcm_[size_t(i) * ch + c] * g;
+    }
+}
+
+void BridgeEngine::BeginNative() {
+    const uint64_t epoch = asio_.Epoch();
+    if (epoch != asioEpoch_) {
+        // The driver ran dry: what it played last faded out to silence, so the stream restarts from silence.
+        asioEpoch_ = epoch;
+        dsd_.Reset();
+        fadeInPos_ = 0;
+    }
+    FillHead();
+    headJob_->Run();
+    headPending_ = true;
+}
+
 void BridgeEngine::QueueNative(const std::vector<float>& out) {
     // The PCM is modulated fadeFrames_ (L) late: the period sent now is the L held frames plus the first n - L of
     // `out`, and the last L frames of `out`, faded out, are its emergency continuation (the real signal), so a dropout
-    // never ends the stream abruptly.
+    // never ends the stream abruptly. The held head was modulated meanwhile on the head thread (BeginNative).
     const uint32_t n = bufferFrames_, ch = channels_, hold = fadeFrames_;
-    constexpr double kPi = 3.14159265358979323846;
-    // Raised-cosine gains: fade-in at position p after a restart, fade-out at k.
-    auto fadeIn = [&](uint64_t p) {
-        return p < fadeFrames_ ? float(0.5 - 0.5 * std::cos(kPi * double(p + 1) / (fadeFrames_ + 1))) : 1.0f;
-    };
-    auto fadeOut = [&](uint32_t k) {
-        return k < fadeFrames_ ? float(0.5 + 0.5 * std::cos(kPi * (k + 1) / (fadeFrames_ + 1))) : 0.0f;
-    };
     // Emergency continuation: modulated fade-out, ~1/4 of the fade of modulated silence, then the DSD idle pattern.
     const uint32_t tail = std::min(n, fadeFrames_ + fadeFrames_ / 4 + 16);
+    headJob_->Wait();
+    bool headDone = headPending_;
+    headPending_ = false;
     for (;;) {
         const uint64_t epoch = asio_.Epoch();
         if (epoch != asioEpoch_) {
-            // The driver ran dry: what it played last faded out to silence, so the stream restarts from silence.
+            // The driver ran dry meanwhile: the stream restarts from silence, the head is modulated again.
             asioEpoch_ = epoch;
             dsd_.Reset();
             fadeInPos_ = 0;
+            headDone = false;
         }
+        if (!headDone) {
+            FillHead();
+            dsd_.Process(modPcm_.data(), hold, dsdWords_.data());
+        }
+        headDone = false;  // a retry builds the whole period again
         const bool fading = fadeInPos_ < fadeFrames_;
-        for (uint32_t i = 0; i < n; ++i) {
-            const float* src = i < hold ? &holdPcm_[size_t(i) * ch] : &out[size_t(i - hold) * ch];
-            const float g = fading ? fadeIn(uint64_t(fadeInPos_) + i) : 1.0f;
-            for (uint32_t c = 0; c < ch; ++c) modPcm_[size_t(i) * ch + c] = src[c] * g;
+        for (uint32_t i = hold; i < n; ++i) {
+            const float g = fading ? FadeIn(uint64_t(fadeInPos_) + i) : 1.0f;
+            for (uint32_t c = 0; c < ch; ++c) modPcm_[size_t(i) * ch + c] = out[size_t(i - hold) * ch + c] * g;
         }
-        dsd_.Process(modPcm_.data(), n, dsdWords_.data());
+        dsd_.Process(modPcm_.data() + size_t(hold) * ch, n - hold, dsdWords_.data() + size_t(hold) * ch);
         // The spare encoder continues from the state this period leaves (bit-exact) with the held-back frames faded
-        // out (from the level a fade-in still running has reached).
+        // out (from the level a fade-in still running has reached). It runs on the spare thread once the period is
+        // queued: its result is needed only if the next period comes too late, at least one period from now.
+        spareJob_->Wait();
         for (uint32_t k = 0; k < tail; ++k) {
-            const float g = k < hold ? fadeOut(k) * fadeIn(uint64_t(fadeInPos_) + n + k) : 0.0f;
+            const float g = k < hold ? FadeOut(k) * FadeIn(uint64_t(fadeInPos_) + n + k) : 0.0f;
             for (uint32_t c = 0; c < ch; ++c)
                 emergencyPcm_[size_t(k) * ch + c] = k < hold ? out[size_t(n - hold + k) * ch + c] * g : 0.0f;
         }
         dsdSpare_.CopyStateFrom(dsd_);
-        dsdSpare_.Process(emergencyPcm_.data(), tail, emergencyWords_.data());
-        std::fill(emergencyWords_.begin() + size_t(tail) * ch, emergencyWords_.end(), uint16_t{0x6969});
+        uint64_t seq = 0;
+        if (asio_.Push(dsdWords_.data(), nullptr, ch, epoch, &seq)) {
+            spareSeq_ = seq;
+            spareTail_ = tail;
+            spareJob_->Run();
+            break;
+        }
         // Refused only when the driver ran dry meanwhile: build the period again on the restarted stream.
-        if (asio_.Push(dsdWords_.data(), emergencyWords_.data(), ch, epoch) || asio_.Epoch() == epoch) break;
+        if (asio_.Epoch() == epoch) break;
     }
     if (fadeInPos_ < fadeFrames_) fadeInPos_ = std::min(fadeFrames_, fadeInPos_ + n);
     std::copy(out.end() - ptrdiff_t(hold) * ch, out.end(), holdPcm_.begin());

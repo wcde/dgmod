@@ -36,5 +36,7 @@ const DotKernels& Kernels();
 // Specific implementation (for tests); falls back to the best available one if `level` is unsupported.
 DotKernels KernelsFor(SimdLevel level);
 const wchar_t* SimdLevelName(SimdLevel level);
+// AVX-512F with the OS saving the opmask and ZMM state (detected once), on top of AVX2+FMA.
+bool CpuHasAvx512();
 
 }  // namespace dgmod::dsp

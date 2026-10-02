@@ -142,6 +142,64 @@ inline __m256d Extremes4(__m256d* a) {
     return a[0];
 }
 
+// AVX-512 counterparts for 8 elements per vector: one compare-exchange pass (block size K, distance J) of a bitonic
+// network over the lanes of `a`, ascending, or descending with Desc.
+template <bool Desc, int K, int J>
+inline __m512d BitonicExchange512(__m512d a) {
+    constexpr __mmask8 kMaxLanes = [] {
+        int mask = 0;
+        for (int l = 0; l < 8; ++l) {
+            const bool asc = ((l & K) == 0) != Desc;
+            if (((l & J) == 0) != asc) mask |= 1 << l;
+        }
+        return __mmask8(mask);
+    }();
+    __m512d p;
+    if constexpr (J == 1) p = _mm512_permute_pd(a, 0x55);
+    else if constexpr (J == 2) p = _mm512_permutex_pd(a, 0x4E);
+    else p = _mm512_shuffle_f64x2(a, a, 0x4E);
+    return _mm512_mask_blend_pd(kMaxLanes, _mm512_min_pd(a, p), _mm512_max_pd(a, p));
+}
+
+template <bool Desc>
+inline __m512d BitonicSort512(__m512d a) {
+    a = BitonicExchange512<Desc, 2, 1>(a);
+    a = BitonicExchange512<Desc, 4, 2>(a);
+    a = BitonicExchange512<Desc, 4, 1>(a);
+    a = BitonicExchange512<Desc, 8, 4>(a);
+    a = BitonicExchange512<Desc, 8, 2>(a);
+    return BitonicExchange512<Desc, 8, 1>(a);
+}
+
+// The 4 largest (Desc) or smallest of the 8V elements of `a`, sorted (as Extremes4, whose result it equals for
+// distinct elements).
+template <size_t V, bool Desc>
+inline __m256d Extremes4Avx512(__m512d* a) {
+    const __m512i reverse = _mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0);
+    for (size_t j = 0; j < V; ++j) a[j] = BitonicSort512<Desc>(a[j]);
+    for (size_t w = 1; w < V; w *= 2) {
+        for (size_t j = 0; j + w < V; j += 2 * w) {
+            const __m512d r = _mm512_permutexvar_pd(reverse, a[j + w]);
+            __m512d m = Desc ? _mm512_max_pd(a[j], r) : _mm512_min_pd(a[j], r);
+            m = BitonicExchange512<Desc, 16, 4>(m);
+            m = BitonicExchange512<Desc, 16, 2>(m);
+            a[j] = BitonicExchange512<Desc, 16, 1>(m);
+        }
+    }
+    return _mm512_castpd512_pd256(a[0]);
+}
+
+template <size_t V>
+size_t ArgMinAvx512(const double* a) {
+    __m512d m = _mm512_load_pd(a);
+    for (size_t j = 1; j < V; ++j) m = _mm512_min_pd(m, _mm512_load_pd(a + 8 * j));
+    const __m512d least = _mm512_set1_pd(_mm512_reduce_min_pd(m));
+    for (size_t j = 0; j < V; ++j)
+        if (const __mmask8 k = _mm512_cmp_pd_mask(_mm512_load_pd(a + 8 * j), least, _CMP_EQ_OQ))
+            return 8 * j + size_t(std::countr_zero(unsigned(k)));
+    return 0;
+}
+
 void FlushDenormals() {
 #if defined(_M_X64) || defined(_M_IX86)
     _mm_setcsr(_mm_getcsr() | 0x8040);  // FTZ | DAZ
@@ -163,6 +221,8 @@ const wchar_t* LookAheadName(LookAhead level) {
         default: return L"off";
     }
 }
+
+bool DeltaSigmaModulator::UsesAvx512() const { return allowAvx512_ && paths_ >= 8 && CpuHasAvx512(); }
 
 LookAheadShape LookAheadFor(LookAhead level, uint32_t dsdRate) {
     if (level == LookAhead::Off || dsdRate == 0 || dsdRate > kLookAheadMaxRate) return {};
@@ -587,8 +647,142 @@ void DeltaSigmaModulator::RunLookAheadAvx2(const float* in, uint32_t stride, uin
     clips_ += clips;
 }
 
+// RunLookAheadAvx2 with the paths in AVX-512 vectors (8 or more paths): the same operations in the same order, so the
+// output is bit-identical to it.
+template <size_t N, size_t M>
+void DeltaSigmaModulator::RunLookAheadAvx512(const float* in, uint32_t stride, uint32_t n, uint16_t* words) {
+    static_assert(M % 8 == 0);
+    constexpr size_t V = M / 8;
+    __m512d b1[N], b2[N], a1[N], a2[N], q1[N], q2[N];
+    double qsum = 0;
+    for (size_t k = 0; k < N; ++k) {
+        const Section& c = sections_[k];
+        b1[k] = _mm512_set1_pd(c.b1), b2[k] = _mm512_set1_pd(c.b2), a1[k] = _mm512_set1_pd(c.a1);
+        a2[k] = _mm512_set1_pd(c.a2), q1[k] = _mm512_set1_pd(q1_[k]), q2[k] = _mm512_set1_pd(q2_[k]);
+        qsum += q1_[k];
+    }
+    Paths& t = trellis_;
+    const uint32_t shift = depth_ - 1;
+    const double clip = clip_;
+    const __m512d dead = _mm512_set1_pd(kDead), one = _mm512_set1_pd(1.0), minusOne = _mm512_set1_pd(-1.0),
+                  hi = _mm512_set1_pd(clip), lo = _mm512_set1_pd(-clip), knee = _mm512_set1_pd(kClipKnee),
+                  penalty = _mm512_set1_pd(kClipPenalty), limit = _mm512_set1_pd(limit_), vq = _mm512_set1_pd(qsum),
+                  twoQ = _mm512_set1_pd(2.0 * qsum), zero = _mm512_setzero_pd();
+    const __m512i lsb = _mm512_set1_epi64(1), keyMask = _mm512_set1_epi64(~int64_t{63});
+    const __m128i count = _mm_cvtsi32_si128(int(shift));
+    __m512i slotKey[V];  // slot p as key bits: p << 1 (child flag in bit 0)
+    for (size_t j = 0; j < V; ++j)
+        slotKey[j] = _mm512_slli_epi64(
+            _mm512_add_epi64(_mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7), _mm512_set1_epi64(int64_t(8 * j))), 1);
+    double peak = peakV_;
+    uint64_t clips = 0;
+    uint32_t word = 0;
+    alignas(64) double v[M], vcs[M], bad[M], cost[M];
+    alignas(64) uint64_t hist[M], goodKeys[4], badKeys[4];
+    uint32_t src[M];
+    for (uint32_t i = 0; i < n; ++i) {
+        const __m512d u = _mm512_set1_pd(double(in[size_t(i) * stride]));
+        __m512d sum[V], next[V], xs[V], gk[V], bk[V];
+        __mmask8 up[V];
+        for (size_t j = 0; j < V; ++j) sum[j] = next[j] = zero, xs[j] = _mm512_load_pd(t.x + 8 * j);
+        for (size_t k = 0; k < N; ++k) {
+            for (size_t j = 0; j < V; ++j) {
+                const __m512d s1 = _mm512_fmadd_pd(xs[j], q1[k], _mm512_load_pd(t.s1[k] + 8 * j));
+                const __m512d s2 = _mm512_fmadd_pd(xs[j], q2[k], _mm512_load_pd(t.s2[k] + 8 * j));
+                const __m512d y = _mm512_add_pd(sum[j], s1);
+                const __m512d n1 = _mm512_fmadd_pd(b1[k], sum[j], _mm512_fnmadd_pd(a1[k], y, s2));
+                const __m512d n2 = _mm512_fnmadd_pd(a2[k], y, _mm512_mul_pd(b2[k], sum[j]));
+                _mm512_store_pd(t.s1[k] + 8 * j, n1);
+                _mm512_store_pd(t.s2[k] + 8 * j, n2);
+                next[j] = _mm512_add_pd(next[j], n1);
+                sum[j] = y;
+            }
+        }
+        uint32_t goodUp = 0;
+        for (size_t j = 0; j < V; ++j) {
+            const __m512d vp = _mm512_add_pd(u, sum[j]);
+            const __m512d vc = _mm512_min_pd(_mm512_max_pd(vp, lo), hi);
+            const __m512d fUp = _mm512_fmadd_pd(_mm512_sub_pd(one, vc), vq, next[j]);
+            const __m512d fDown = _mm512_sub_pd(fUp, twoQ);
+            const __m512d av = _mm512_abs_pd(vp);
+            const __m512d over = _mm512_mul_pd(_mm512_max_pd(_mm512_sub_pd(av, knee), zero), penalty);
+            const __m512d c = _mm512_fmadd_pd(over, over, _mm512_load_pd(t.cost + 8 * j));
+            const __m512d cUp = _mm512_fmadd_pd(fUp, fUp, c), cDown = _mm512_fmadd_pd(fDown, fDown, c);
+            const __mmask8 ok = _mm512_cmp_pd_mask(av, limit, _CMP_LE_OQ);  // false for a run-away path (also NaN)
+            up[j] = _mm512_cmp_pd_mask(cUp, cDown, _CMP_LE_OQ);
+            const __m512d g = _mm512_mask_blend_pd(ok, dead, _mm512_min_pd(cUp, cDown));
+            const __m512d b = _mm512_mask_blend_pd(ok, dead, _mm512_max_pd(cUp, cDown));
+            _mm512_store_pd(v + 8 * j, vp);
+            _mm512_store_pd(vcs + 8 * j, vc);
+            _mm512_store_pd(cost + 8 * j, g);
+            _mm512_store_pd(bad + 8 * j, b);
+            goodUp |= uint32_t(up[j]) << (8 * j);
+            // Sort keys as in RunLookAheadAvx2.
+            gk[j] = _mm512_castsi512_pd(
+                _mm512_or_si512(_mm512_and_si512(_mm512_castpd_si512(_mm512_add_pd(g, one)), keyMask), slotKey[j]));
+            bk[j] = _mm512_castsi512_pd(_mm512_or_si512(_mm512_and_si512(_mm512_castpd_si512(_mm512_add_pd(b, one)), keyMask),
+                                                        _mm512_or_si512(slotKey[j], lsb)));
+        }
+        const __m256d worstGood = Extremes4Avx512<V, true>(gk), bestBad = Extremes4Avx512<V, false>(bk);
+        const uint32_t lower = uint32_t(_mm256_movemask_pd(_mm256_cmp_pd(bestBad, worstGood, _CMP_LT_OQ)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(goodKeys), _mm256_castpd_si256(worstGood));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(badKeys), _mm256_castpd_si256(bestBad));
+        for (size_t j = 0; j < V; ++j) {
+            _mm512_store_pd(t.x + 8 * j,
+                            _mm512_sub_pd(_mm512_mask_blend_pd(up[j], minusOne, one), _mm512_load_pd(vcs + 8 * j)));
+            const __m512i h = _mm512_slli_epi64(_mm512_load_si512(t.history + 8 * j), 1);
+            _mm512_store_si512(hist + 8 * j, _mm512_mask_or_epi64(h, up[j], h, lsb));
+        }
+        // Slots taken over by a bad child get its parent's state, error, history and cost.
+        uint32_t flipped = 0;
+        for (uint32_t r = 0, k = uint32_t(std::popcount(lower)); r < k; ++r) {
+            const uint32_t p = uint32_t(goodKeys[r] & 63) >> 1, b = uint32_t(badKeys[r] & 63) >> 1;
+            const bool upB = ((goodUp >> b) & 1u) == 0;
+            src[p] = b;
+            flipped |= 1u << p;
+            cost[p] = bad[b];
+            t.x[p] = (upB ? 1.0 : -1.0) - vcs[b];
+            hist[p] = (t.history[b] << 1) | (upB ? 1u : 0u);
+            for (size_t k2 = 0; k2 < N; ++k2) t.s1[k2][p] = t.s1[k2][b], t.s2[k2][p] = t.s2[k2][b];
+        }
+        const size_t best = ArgMinAvx512<V>(cost);
+        const uint64_t bit = (hist[best] >> shift) & 1u;
+        const double base = cost[best];
+        if (base < kAlive) {
+            const __m512d vb = _mm512_set1_pd(base);
+            const __m512i vbit = _mm512_set1_epi64(int64_t(bit));
+            for (size_t j = 0; j < V; ++j) {
+                const __m512i h = _mm512_load_si512(hist + 8 * j);
+                const __mmask8 keep = _mm512_cmpeq_epi64_mask(_mm512_and_si512(_mm512_srl_epi64(h, count), lsb), vbit);
+                _mm512_store_pd(t.cost + 8 * j,
+                                _mm512_mask_blend_pd(keep, dead, _mm512_sub_pd(_mm512_load_pd(cost + 8 * j), vb)));
+                _mm512_store_si512(t.history + 8 * j, h);
+            }
+            const double av = std::abs(v[(flipped >> best) & 1u ? src[best] : best]);
+            peak = std::max(peak, av);
+            clips += av > clip;
+        } else {  // every path ran away
+            ResetPaths(hist[best]);
+            ++resets_;
+            peak = 0;
+        }
+        word = (word << 1) | static_cast<uint32_t>(bit);
+        if ((i & 15) == 15) words[i >> 4] = static_cast<uint16_t>(word);
+    }
+    peakV_ = peak;
+    clips_ += clips;
+}
+
 template <size_t N>
 void DeltaSigmaModulator::DispatchLookAhead(const float* in, uint32_t stride, uint32_t n, uint16_t* words) {
+    if (UsesAvx512()) {
+        switch (paths_) {
+            case 8: RunLookAheadAvx512<N, 8>(in, stride, n, words); break;
+            case 16: RunLookAheadAvx512<N, 16>(in, stride, n, words); break;
+            default: RunLookAheadAvx512<N, 32>(in, stride, n, words); break;
+        }
+        return;
+    }
     if (Kernels().level == SimdLevel::Avx2) {
         switch (paths_) {
             case 4: RunLookAheadAvx2<N, 4>(in, stride, n, words); break;

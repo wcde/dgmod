@@ -29,8 +29,8 @@ double PredictedNoiseDb(const NtfDesign& ntf, double fs, double f0, double f1);
 // Look-ahead of the modulator (pruned tree search): Off decides every bit on its own (sign of the quantizer input);
 // the others keep the best `paths` bit sequences and commit a bit `depth` samples later, choosing the sequence whose
 // noise-shaping filter output has the least energy. It extends the stable input range (DSD256: about 0.8 of full
-// scale with Standard, 0.85 with High, against 0.75-0.8 without), at a CPU cost of roughly 0.3 (Standard) and 0.55
-// (High) of a core per channel on a current desktop CPU.
+// scale with Standard, 0.85 with High, against 0.75-0.8 without), at a CPU cost of roughly 0.3 (Standard) and 0.5
+// (High; 0.4 with AVX-512) of a core per channel on a current desktop CPU.
 enum class LookAhead : uint32_t { Off = 0, Standard = 1, High = 2 };
 inline constexpr uint32_t kLookAheadLevels = 3;
 // Highest DSD rate with look-ahead (DSD256): above it one channel alone would take most of a core.
@@ -76,6 +76,9 @@ public:
     [[nodiscard]] double PeakQuantizerInput() const { return peakV_; }
     [[nodiscard]] double ClipLevel() const { return clip_; }
     void SetClipLevel(double clip) { clip_ = clip; }  // for tests
+    // The look-ahead runs on the AVX-512 kernel (8 paths or more, on a CPU with AVX-512F; the same output as AVX2).
+    [[nodiscard]] bool UsesAvx512() const;
+    void AllowAvx512(bool allow) { allowAvx512_ = allow; }  // for tests
 
 private:
     struct Section {
@@ -92,6 +95,8 @@ private:
     void RunLookAhead(const float* in, uint32_t stride, uint32_t n, uint16_t* words);
     template <size_t N, size_t M>
     void RunLookAheadAvx2(const float* in, uint32_t stride, uint32_t n, uint16_t* words);
+    template <size_t N, size_t M>
+    void RunLookAheadAvx512(const float* in, uint32_t stride, uint32_t n, uint16_t* words);
     template <size_t N>
     void DispatchLookAhead(const float* in, uint32_t stride, uint32_t n, uint16_t* words);
     void ResetPaths(uint64_t history);
@@ -115,6 +120,7 @@ private:
     double limit_ = 0;  // |v| above this means the loop ran away despite the clipping
     double peakV_ = 0;
     uint64_t resets_ = 0, clips_ = 0;
+    bool allowAvx512_ = true;
 };
 
 // DSD encoder: interpolates PCM at the DoP frame rate by 16 to the DSD rate (short linear-phase polyphase filter; the
@@ -158,6 +164,10 @@ public:
     [[nodiscard]] const NtfDesign& Ntf() const { return ntf_; }
     [[nodiscard]] double NoiseBandHz() const { return noiseBand_; }
     [[nodiscard]] LookAheadShape LookAheadUsed() const { return shape_; }
+    [[nodiscard]] bool LookAheadAvx512() const { return !modulators_.empty() && modulators_[0].UsesAvx512(); }
+    void AllowAvx512(bool allow) {  // for tests
+        for (auto& m : modulators_) m.AllowAvx512(allow);
+    }
     void SetClipLevel(double clip) {  // for tests
         for (auto& m : modulators_) m.SetClipLevel(clip);
     }
