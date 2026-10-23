@@ -3,6 +3,7 @@
 #include "common/AsioDrivers.h"
 #include "common/AudioFormat.h"
 #include "common/PolicyConfig.h"
+#include "dsp/FixedEdge.h"
 
 #include <avrt.h>
 #include <xmmintrin.h>
@@ -360,12 +361,15 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
             body();
         };
         dsd_.SetThreadWrapper(proAudio);
-        dsd_.Configure(channels_, outRate_, inRate_ * 0.5, bufferFrames_, cfg.dsdLookAhead);
+        dsd_.Configure(channels_, outRate_, inRate_ * 0.5, bufferFrames_, cfg.dsdLookAhead, cfg.dsdModulator);
         dsdWords_.assign(size_t(bufferFrames_) * channels_, 0);
-        dsdScale_ = cfg.dsdHighLevel ? 0.70710678f : 0.5f;
+        // The fixed-edge code is stable up to about 0.65 of full scale: always the SACD reference level.
+        dsdScale_ = dsd_.FixedEdgeUsed()   ? static_cast<float>(dsp::FixedEdgeModulator::kLevel)
+                    : cfg.dsdHighLevel ? 0.70710678f
+                                       : 0.5f;
         if (native_) {
             dsdSpare_.SetThreadWrapper(proAudio);
-            dsdSpare_.Configure(channels_, outRate_, inRate_ * 0.5, bufferFrames_, cfg.dsdLookAhead);
+            dsdSpare_.Configure(channels_, outRate_, inRate_ * 0.5, bufferFrames_, cfg.dsdLookAhead, cfg.dsdModulator);
             emergencyWords_.assign(dsdWords_.size(), 0);
             modPcm_.assign(dsdWords_.size(), 0.0f);
             emergencyPcm_.assign(dsdWords_.size(), 0.0f);
@@ -386,6 +390,7 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     base_.dsdNoiseBandHz = Dsd() ? dsd_.NoiseBandHz() : 0.0;
     base_.dsdLookAheadPaths = Dsd() ? dsd_.LookAheadUsed().paths : 0u;
     base_.dsdLookAheadDepth = Dsd() ? dsd_.LookAheadUsed().depth : 0u;
+    base_.dsdFixedEdge = Dsd() && dsd_.FixedEdgeUsed() ? 1u : 0u;
     // The shape actually built (NOS is linear phase, and falls back to the slow roll-off without oversampling; the
     // equiripple design needs the two-stage cascade).
     const dsp::FilterSpec used = plan ? plan->filter.spec : dsp::FilterSpec{};
@@ -417,13 +422,19 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
                                              limiterOn_ ? L", limiter" : L"");
     if (Dsd()) {
         const dsp::LookAheadShape la = dsd_.LookAheadUsed();
-        dsp += std::format(L", {} DSD{} ({} Hz, modulator order {}{}, noise shaped to {:.0f} kHz, {} % level)",
-                           dop_ ? L"DoP" : L"native", dsd_.DsdRate() / 44100, dsd_.DsdRate(), dsd_.Ntf().order,
-                           la.paths ? std::format(L", look-ahead {} paths x {} bits{}", la.paths, la.depth,
-                                                  dsd_.LookAheadAvx512() ? L" (AVX-512)" : L"")
-                           : cfg.dsdLookAhead != dsp::LookAhead::Off ? std::wstring(L", look-ahead off above DSD256")
-                                                                     : std::wstring(),
-                           dsd_.NoiseBandHz() / 1000.0, std::lround(dsdScale_ * 100.0f));
+        using dsp::FixedEdgeModulator;
+        const std::wstring search =
+            dsd_.FixedEdgeUsed() ? std::format(L", fixed-edge {}-bit cells, {} paths x {} cells", FixedEdgeModulator::kCell,
+                                               FixedEdgeModulator::kPaths, FixedEdgeModulator::kDepth)
+            : la.paths ? std::format(L", look-ahead {} paths x {} bits{}", la.paths, la.depth,
+                                     dsd_.LookAheadAvx512() ? L" (AVX-512)" : L"")
+            : cfg.dsdLookAhead != dsp::LookAhead::Off ? std::wstring(L", look-ahead off above DSD256")
+                                                      : std::wstring();
+        const wchar_t* fallback =
+            cfg.dsdModulator == dsp::DsdModulator::FixedEdge && !dsd_.FixedEdgeUsed() ? L", fixed-edge only at DSD256" : L"";
+        dsp += std::format(L", {} DSD{} ({} Hz, modulator order {}{}{}, noise shaped to {:.0f} kHz, {} % level)",
+                           dop_ ? L"DoP" : L"native", dsd_.DsdRate() / 44100, dsd_.DsdRate(), dsd_.Ntf().order, search,
+                           fallback, dsd_.NoiseBandHz() / 1000.0, std::lround(dsdScale_ * 100.0f));
     }
     if (native_) dsp += std::format(L" via ASIO \"{}\"", base_.asioDriver);
     Log(std::format(L"session: {} ({} Hz, {} ch) -> {} ({} Hz, {}/{} bit, {} frames/period), {}, target {:.1f} ms",

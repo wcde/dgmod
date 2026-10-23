@@ -13,7 +13,7 @@
 namespace dgmod {
 
 inline constexpr uint32_t kBridgeStatusMagic = 0x4D474744;  // "DGGM"
-inline constexpr uint32_t kBridgeStatusVersion = 9;
+inline constexpr uint32_t kBridgeStatusVersion = 10;
 
 // An exclusive-mode format of the output device, probed by the bridge before it opens the device (while the bridge
 // holds the device, nobody else can probe it).
@@ -80,6 +80,7 @@ struct BridgeStatusData {
     double dsdNoiseBandHz = 0;                // DSD: band the modulator keeps its noise out of
     uint32_t dsdLookAheadPaths = 0;           // DSD: look-ahead paths of the modulator (0 = off)
     uint32_t dsdLookAheadDepth = 0;           // DSD: look-ahead depth in bits
+    uint32_t dsdFixedEdge = 0;                // DSD: the fixed-edge modulator is in use (no look-ahead then)
     uint32_t limiter = 0;      // true-peak limiter active
     uint32_t warmth = 0;       // 0 = off, else 1 + dsp::WarmthType
     float warmthAmount = 0;    // 0..1

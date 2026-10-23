@@ -1,6 +1,7 @@
 #include "dsp/DeltaSigma.h"
 
 #include "dsp/Dot.h"
+#include "dsp/FixedEdge.h"
 #include "dsp/Kernel.h"
 
 #include <immintrin.h>
@@ -222,6 +223,10 @@ const wchar_t* LookAheadName(LookAhead level) {
     }
 }
 
+const wchar_t* DsdModulatorName(DsdModulator modulator) {
+    return modulator == DsdModulator::FixedEdge ? L"fixed-edge" : L"delta-sigma";
+}
+
 bool DeltaSigmaModulator::UsesAvx512() const { return allowAvx512_ && paths_ >= 8 && CpuHasAvx512(); }
 
 LookAheadShape LookAheadFor(LookAhead level, uint32_t dsdRate) {
@@ -262,8 +267,7 @@ NtfDesign SynthesizeNtf(int order, double osr, double hinf) {
         }
     }
     // Poles: maximally flat high-pass family, parameter x adjusted by a secant search until |NTF(-1)| = hinf.
-    double x = std::pow(0.3, order - 1), deltaX = 0, fPrev = 0;
-    for (int itn = 1; itn <= 100; ++itn) {
+    auto place = [&](double x) {
         const double me2 = -0.5 * std::pow(x, 2.0 / order);
         d.poles.clear();
         for (int k = 1; k <= order; ++k) {
@@ -273,18 +277,32 @@ NtfDesign SynthesizeNtf(int order, double osr, double hinf) {
             if (std::abs(p) > 1.0) p = 1.0 / p;
             d.poles.push_back(p);
         }
-        const double f = Evaluate(d, -1.0).real() - hinf;
+        return Evaluate(d, -1.0).real() - hinf;
+    };
+    double x = std::pow(0.3, order - 1), deltaX = 0, fPrev = 0, f = 0;
+    for (int itn = 1; itn <= 100; ++itn) {
+        f = place(x);
         deltaX = itn == 1 ? -f / 100.0 : -f * deltaX / (f - fPrev);
         const double next = x + deltaX;
         x = next > 0 ? next : x * 0.1;
         fPrev = f;
         if (std::abs(f) < 1e-10 || std::abs(deltaX) < 1e-10) break;
     }
+    if (std::abs(f) > 1e-3 && hinf > 1.0) {
+        // The secant stalls for a gain close to 1 (x tiny; it ends far off): bisection over log x, where |NTF(-1)| rises
+        // from 1. Designs the secant gets right keep its poles exactly.
+        double lo = -60.0, hi = 0.0;
+        for (int itn = 0; itn < 200 && hi - lo > 1e-15; ++itn) {
+            const double mid = 0.5 * (lo + hi);
+            (place(std::pow(10.0, mid)) < 0.0 ? lo : hi) = mid;
+        }
+        place(std::pow(10.0, hi));
+    }
     return d;
 }
 
-void DeltaSigmaModulator::Configure(const NtfDesign& ntf, LookAheadShape shape) {
-    sections_.clear();
+std::vector<NtfSection> NtfSections(const NtfDesign& ntf) {
+    std::vector<NtfSection> sections;
     std::vector<std::complex<double>> zp, pp;  // upper half-plane members of conjugate pairs
     double realZero = 0, realPole = 0;
     bool hasReal = false;
@@ -303,12 +321,18 @@ void DeltaSigmaModulator::Configure(const NtfDesign& ntf, LookAheadShape shape) 
     auto byAngle = [](const std::complex<double>& a, const std::complex<double>& b) { return std::arg(a) < std::arg(b); };
     std::sort(zp.begin(), zp.end(), byAngle);
     std::sort(pp.begin(), pp.end(), byAngle);
-    if (hasReal) sections_.push_back({-realZero, 0.0, -realPole, 0.0});
+    if (hasReal) sections.push_back({-realZero, 0.0, -realPole, 0.0});
     for (size_t i = 0; i < std::min(zp.size(), pp.size()); ++i) {
         // 1 - 2cos(w) z^-1 + z^-2 with -2cos(w) = -2 + 4 sin^2(w/2), exact for the tiny band angles.
         const double s = std::sin(std::arg(zp[i]) * 0.5);
-        sections_.push_back({-2.0 + 4.0 * s * s, std::norm(zp[i]), -2.0 * pp[i].real(), std::norm(pp[i])});
+        sections.push_back({-2.0 + 4.0 * s * s, std::norm(zp[i]), -2.0 * pp[i].real(), std::norm(pp[i])});
     }
+    return sections;
+}
+
+void DeltaSigmaModulator::Configure(const NtfDesign& ntf, LookAheadShape shape) {
+    sections_.clear();
+    for (const NtfSection& s : NtfSections(ntf)) sections_.push_back({s.b1, s.b2, s.a1, s.a2});
     // A stable loop keeps its quantizer input within about +-0.8 at the highest levels it encodes (+-0.72 at 0.707);
     // clipping at 1.0 never touches that, and past the stable range it keeps the most signal (measured at 0.8 of
     // full scale: 93 dB SNR against 47 dB with resets). Far beyond the clip level the loop has run away.
@@ -856,7 +880,7 @@ DsdEncoder::DsdEncoder() = default;
 DsdEncoder::~DsdEncoder() = default;
 
 bool DsdEncoder::Configure(uint32_t channels, uint32_t frameRate, double bandHz, uint32_t maxFrames, LookAhead lookAhead,
-                           int order, double hinf) {
+                           DsdModulator modulator, int order, double hinf) {
     helper_.reset();
     if (channels == 0 || frameRate == 0 || maxFrames == 0) return false;
     channels_ = channels;
@@ -888,24 +912,34 @@ bool DsdEncoder::Configure(uint32_t channels, uint32_t frameRate, double bandHz,
     }
 
     const double fs = DsdRate();
-    const double floorBand = std::min(bandHz, 22050.0);
-    noiseBand_ = floorBand;
-    ntf_ = SynthesizeNtf(order, fs / (2.0 * floorBand), hinf);
-    for (double band = 50000.0; band > floorBand; band -= 1000.0) {
-        const NtfDesign wide = SynthesizeNtf(order, fs / (2.0 * band), hinf);
-        if (PredictedNoiseDb(wide, fs, 0.0, 20000.0) <= -160.0 && PredictedNoiseDb(wide, fs, 0.0, band) <= -140.0) {
-            noiseBand_ = band;
-            ntf_ = wide;
-            break;
+    modulators_.clear();
+    fixedEdge_.clear();
+    shape_ = {};
+    if (modulator == DsdModulator::FixedEdge && DsdRate() == FixedEdgeModulator::kRate) {
+        noiseBand_ = FixedEdgeModulator::kBandHz;
+        ntf_ = SynthesizeNtf(FixedEdgeModulator::kOrder, fs / (2.0 * noiseBand_), FixedEdgeModulator::kHinf);
+        fixedEdge_.assign(channels, {});
+        for (auto& m : fixedEdge_) m.Configure(ntf_);
+    } else {
+        const double floorBand = std::min(bandHz, 22050.0);
+        noiseBand_ = floorBand;
+        ntf_ = SynthesizeNtf(order, fs / (2.0 * floorBand), hinf);
+        for (double band = 50000.0; band > floorBand; band -= 1000.0) {
+            const NtfDesign wide = SynthesizeNtf(order, fs / (2.0 * band), hinf);
+            if (PredictedNoiseDb(wide, fs, 0.0, 20000.0) <= -160.0 && PredictedNoiseDb(wide, fs, 0.0, band) <= -140.0) {
+                noiseBand_ = band;
+                ntf_ = wide;
+                break;
+            }
         }
+        modulators_.assign(channels, {});
+        for (auto& m : modulators_) m.Configure(ntf_, LookAheadFor(lookAhead, DsdRate()));
+        shape_ = modulators_[0].Shape();
     }
-    modulators_.assign(channels, {});
-    for (auto& m : modulators_) m.Configure(ntf_, LookAheadFor(lookAhead, DsdRate()));
-    shape_ = modulators_[0].Shape();
     history_.assign(channels, std::vector<float>(size_t(taps_) - 1 + maxFrames, 0.0f));
     upsampled_.assign(channels, std::vector<float>(size_t(kFactor) * maxFrames, 0.0f));
     words_.assign(channels, std::vector<uint16_t>(maxFrames, 0));
-    if (shape_.paths && channels > 1) {
+    if ((shape_.paths || FixedEdgeUsed()) && channels > 1) {
         helper_ = std::make_unique<Helper>();
         Helper* h = helper_.get();
         h->owner = this;
@@ -920,18 +954,21 @@ bool DsdEncoder::Configure(uint32_t channels, uint32_t frameRate, double bandHz,
 void DsdEncoder::Reset() {
     for (auto& h : history_) std::fill(h.begin(), h.end(), 0.0f);
     for (auto& m : modulators_) m.Reset();
+    for (auto& m : fixedEdge_) m.Reset();
 }
 
 void DsdEncoder::CopyStateFrom(const DsdEncoder& other) {
     for (uint32_t c = 0; c < channels_ && c < other.channels_; ++c) {
         std::copy_n(other.history_[c].begin(), taps_ - 1, history_[c].begin());
-        modulators_[c] = other.modulators_[c];  // same section count: no allocation
+        if (c < modulators_.size()) modulators_[c] = other.modulators_[c];  // same section count: no allocation
+        if (c < fixedEdge_.size()) fixedEdge_[c] = other.fixedEdge_[c];
     }
 }
 
 uint64_t DsdEncoder::Resets() const {
     uint64_t n = 0;
     for (const auto& m : modulators_) n += m.Resets();
+    for (const auto& m : fixedEdge_) n += m.Resets();
     return n;
 }
 
@@ -944,6 +981,7 @@ uint64_t DsdEncoder::Clips() const {
 double DsdEncoder::PeakQuantizerInput() const {
     double v = 0;
     for (const auto& m : modulators_) v = std::max(v, m.PeakQuantizerInput());
+    for (const auto& m : fixedEdge_) v = std::max(v, m.PeakQuantizerInput());
     return v;
 }
 
@@ -961,7 +999,8 @@ void DsdEncoder::Interpolate(uint32_t c, const float* in, uint32_t n) {
 void DsdEncoder::EncodeChannels(uint32_t first, uint32_t last, const float* in, uint32_t n) {
     for (uint32_t c = first; c < last; ++c) {
         Interpolate(c, in, n);
-        modulators_[c].Process(upsampled_[c].data(), 1, n * kFactor, words_[c].data());
+        if (FixedEdgeUsed()) fixedEdge_[c].Process(upsampled_[c].data(), 1, n * kFactor, words_[c].data());
+        else modulators_[c].Process(upsampled_[c].data(), 1, n * kFactor, words_[c].data());
     }
 }
 
@@ -969,7 +1008,7 @@ void DsdEncoder::Process(const float* in, uint32_t frames, uint16_t* out) {
     while (frames > 0) {
         const uint32_t n = std::min(frames, maxFrames_);
         if (helper_) {
-            // Look-ahead: the upper half of the channels on the helper thread.
+            // Look-ahead or fixed-edge: the upper half of the channels on the helper thread.
             const uint32_t split = (channels_ + 1) / 2;
             helper_->in = in;
             helper_->frames = n;
@@ -978,7 +1017,7 @@ void DsdEncoder::Process(const float* in, uint32_t frames, uint16_t* out) {
             helper_->start.release();
             EncodeChannels(0, split, in, n);
             helper_->done.acquire();
-        } else if (shape_.paths) {
+        } else if (shape_.paths || FixedEdgeUsed()) {
             EncodeChannels(0, channels_, in, n);
         } else {
             for (uint32_t c = 0; c < channels_; ++c) Interpolate(c, in, n);

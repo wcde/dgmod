@@ -36,6 +36,7 @@ void BridgeConfig::Validate() {
         NativeDsd() ? std::span<const uint32_t>(kNativeDsdMultiples) : std::span<const uint32_t>(kDsdMultiples);
     if (std::find(rates.begin(), rates.end(), dsdMultiple) == rates.end()) dsdMultiple = 0;
     if (static_cast<uint32_t>(dsdLookAhead) >= dsp::kLookAheadLevels) dsdLookAhead = dsp::LookAhead::Off;
+    if (static_cast<uint32_t>(dsdModulator) >= dsp::kDsdModulators) dsdModulator = dsp::DsdModulator::DeltaSigma;
     tone.Validate();
 }
 
@@ -65,6 +66,7 @@ BridgeConfig LoadBridgeConfig() {
     if (auto v = reg::ReadDword(k, L"DsdMultiple")) c.dsdMultiple = *v;
     if (auto v = reg::ReadDword(k, L"DsdHighLevel")) c.dsdHighLevel = *v != 0;
     if (auto v = reg::ReadDword(k, L"DsdLookAhead")) c.dsdLookAhead = static_cast<dsp::LookAhead>(*v);
+    if (auto v = reg::ReadDword(k, L"DsdModulator")) c.dsdModulator = static_cast<dsp::DsdModulator>(*v);
     if (auto v = reg::ReadString(k, L"AsioDriver")) c.asioDriver = *v;
     if (auto v = reg::ReadDword(k, L"BufferMs")) c.bufferMs = *v;
     if (auto v = reg::ReadDword(k, L"PeriodMs")) c.periodMs = *v;
@@ -112,6 +114,7 @@ HRESULT SaveBridgeConfig(const BridgeConfig& in) {
     dword(L"DsdMultiple", c.dsdMultiple);
     dword(L"DsdHighLevel", c.dsdHighLevel ? 1u : 0u);
     dword(L"DsdLookAhead", static_cast<DWORD>(c.dsdLookAhead));
+    dword(L"DsdModulator", static_cast<DWORD>(c.dsdModulator));
     str(L"AsioDriver", c.asioDriver);
     dword(L"BufferMs", c.bufferMs);
     dword(L"PeriodMs", c.periodMs);

@@ -101,11 +101,12 @@ int PrintStatus() {
                               b.limiter ? L"on" : L"off", 20.0 * std::log10(std::max(b.limiterMinGain, 1e-6f)),
                               b.limitedFrames, b.clipped,
                               b.dop || b.nativeDsd
-                                  ? std::format(L", noise shaped to {:.0f} kHz, look-ahead {}, modulator resets={} clipped={}",
+                                  ? std::format(L", noise shaped to {:.0f} kHz, {}, modulator resets={} clipped={}",
                                                 b.dsdNoiseBandHz / 1000.0,
-                                                b.dsdLookAheadPaths ? std::format(L"{} paths x {} bits", b.dsdLookAheadPaths,
-                                                                                  b.dsdLookAheadDepth)
-                                                                    : std::wstring(L"off"),
+                                                b.dsdFixedEdge        ? std::wstring(L"fixed-edge modulator")
+                                                : b.dsdLookAheadPaths ? std::format(L"look-ahead {} paths x {} bits",
+                                                                                    b.dsdLookAheadPaths, b.dsdLookAheadDepth)
+                                                                      : std::wstring(L"look-ahead off"),
                                                 b.modulatorResets, b.modulatorClips)
                                                    : std::wstring()));
             Print(std::format(L"        warmth: {}",

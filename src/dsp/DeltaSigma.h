@@ -22,6 +22,13 @@ struct NtfDesign {
 };
 NtfDesign SynthesizeNtf(int order, double osr, double hinf);
 
+// The NTF as a cascade of second-order sections (a first-order one first for an odd order), in the error-feedback
+// form the modulators run: section k turns x into y = x + s1 and updates s1 = b1 x - a1 y + s2, s2 = b2 x - a2 y.
+struct NtfSection {
+    double b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+};
+std::vector<NtfSection> NtfSections(const NtfDesign& ntf);
+
 // Quantization noise the modulator puts into [f0, f1] Hz at the modulator rate `fs` (linear model, uniform error of
 // variance 1/3), in dB relative to a full-scale PCM sine (amplitude 0.5 of the DSD range).
 double PredictedNoiseDb(const NtfDesign& ntf, double fs, double f0, double f1);
@@ -43,6 +50,14 @@ struct LookAheadShape {
 // Paths and depth of a level at the DSD bit rate `dsdRate`: 4 (Standard) or 8 (High) paths at DSD256, twice as many
 // per halving of the rate (up to kMaxPaths), depth kMaxDepth; off above kLookAheadMaxRate.
 LookAheadShape LookAheadFor(LookAhead level, uint32_t dsdRate);
+
+// Modulator of the DSD encoder: the delta-sigma loop (with the look-ahead chosen), or the fixed-edge code for DACs that
+// decode the bits directly (FixedEdgeModulator; DSD256 only, the delta-sigma loop at other rates).
+enum class DsdModulator : uint32_t { DeltaSigma = 0, FixedEdge = 1 };
+inline constexpr uint32_t kDsdModulators = 2;
+const wchar_t* DsdModulatorName(DsdModulator modulator);
+
+class FixedEdgeModulator;
 
 // 1-bit delta-sigma modulator in error-feedback form: v = u + (NTF - 1) e, y = sign(v), e = y - v. The NTF runs as a
 // cascade of second-order sections (numerically robust even with zeros and poles packed next to z = 1), so the
@@ -145,9 +160,12 @@ public:
     // audio band (0-20 kHz) and below -140 dB over the whole band, but never narrower than the source band (at most
     // 22.05 kHz): DSD256 and above keep the rise of the shaped noise away from the audio band and clear hi-res content
     // above 20 kHz of it; DSD64/128 have no margin and stay at 22.05 kHz.
-    // With look-ahead the channels are split between the calling thread and a helper thread (see SetThreadWrapper).
+    // The fixed-edge modulator (at DSD256) uses its own NTF (FixedEdgeModulator) and ignores lookAhead, order, hinf.
+    // With look-ahead or the fixed-edge modulator the channels are split between the calling thread and a helper
+    // thread (see SetThreadWrapper).
     bool Configure(uint32_t channels, uint32_t frameRate, double bandHz, uint32_t maxFrames,
-                   LookAhead lookAhead = LookAhead::Off, int order = 7, double hinf = 1.25);
+                   LookAhead lookAhead = LookAhead::Off, DsdModulator modulator = DsdModulator::DeltaSigma,
+                   int order = 7, double hinf = 1.25);
     void Reset();
     // Takes over the filter history and modulator states of `other` (configured identically) without allocating, so
     // a spare encoder can render an alternative continuation of the same stream.
@@ -164,7 +182,8 @@ public:
     [[nodiscard]] const NtfDesign& Ntf() const { return ntf_; }
     [[nodiscard]] double NoiseBandHz() const { return noiseBand_; }
     [[nodiscard]] LookAheadShape LookAheadUsed() const { return shape_; }
-    [[nodiscard]] bool LookAheadAvx512() const { return !modulators_.empty() && modulators_[0].UsesAvx512(); }
+    [[nodiscard]] bool FixedEdgeUsed() const { return !fixedEdge_.empty(); }
+    [[nodiscard]] bool LookAheadAvx512() const { return shape_.paths && modulators_[0].UsesAvx512(); }
     void AllowAvx512(bool allow) {  // for tests
         for (auto& m : modulators_) m.AllowAvx512(allow);
     }
@@ -189,6 +208,7 @@ private:
     std::vector<std::vector<float>> history_;    // per channel: taps_ - 1 previous frames + the current block
     std::vector<std::vector<float>> upsampled_;  // per channel: kFactor * frames samples
     std::vector<DeltaSigmaModulator> modulators_;
+    std::vector<FixedEdgeModulator> fixedEdge_;  // instead of modulators_ when the fixed-edge code is used
     std::vector<std::vector<uint16_t>> words_;
 };
 

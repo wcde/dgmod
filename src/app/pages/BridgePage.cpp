@@ -1,6 +1,7 @@
 #include "app/Pages.h"
 
 #include "bridge/SlipCopier.h"
+#include "dsp/FixedEdge.h"
 
 #include <shellapi.h>
 
@@ -342,7 +343,9 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
                                    : response == dsp::FilterResponse::Slow     ? L"slow · " + base
                                    : response == dsp::FilterResponse::Gaussian ? L"Gaussian · " + base
                                                                                : base + design;
-        const std::wstring lookAhead = st.dsdLookAheadPaths ? std::format(L" · look-ahead {}", st.dsdLookAheadPaths) : L"";
+        const std::wstring lookAhead = st.dsdFixedEdge        ? std::wstring(L" · fixed-edge")
+                                       : st.dsdLookAheadPaths ? std::format(L" · look-ahead {}", st.dsdLookAheadPaths)
+                                                              : std::wstring();
         StatTile(ui, cols[1], L"Source → output",
                  !running || !st.outRate ? std::wstring(L"—")
                  : st.dop || st.nativeDsd ? std::format(L"{} → DSD{}", RateText(st.inRate), st.dsdRate / 44100)
@@ -489,28 +492,47 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
                 edited = true;
             }
         }
+        // The rate in use when running, else the chosen one (0 = highest available: unknown here).
+        const uint32_t rate = running && (st.dop || st.nativeDsd) && st.dsdRate ? st.dsdRate : 44100u * m.bridge.dsdMultiple;
+        const bool fixedEdgeChosen = m.bridge.dsdModulator == dsp::DsdModulator::FixedEdge;
+        const bool fixedEdge = fixedEdgeChosen && rate == dsp::FixedEdgeModulator::kRate;
+        {
+            const Rect c = SettingRow(ui, r, L"Modulator",
+                                      fixedEdgeChosen && !fixedEdge
+                                          ? (rate ? L"Fixed-edge needs DSD256: delta-sigma at this rate"
+                                                  : L"Fixed-edge needs DSD256: choose it as the DSD rate")
+                                          : L"Fixed-edge suits DACs in 1-bit DSD mode: immune to edge errors, DSD256 only",
+                                      260.f);
+            static const std::wstring kModulators[] = {L"Delta-sigma", L"Fixed-edge"};
+            int mode = static_cast<int>(m.bridge.dsdModulator);
+            if (ui.Segmented(ui.MakeId(L"bridge-dsd-modulator"), c, kModulators, mode)) {
+                m.bridge.dsdModulator = static_cast<dsp::DsdModulator>(mode);
+                edited = true;
+            }
+        }
         {
             const Rect c = SettingRow(ui, r, L"DSD level",
-                                      L"Modulation depth at PCM full scale: 50 % is the SACD reference, +3 dB gives 71 %", 260.f);
+                                      fixedEdge ? L"The fixed-edge modulator always uses 50 % (stable up to 65 %)"
+                                                : L"Modulation depth at PCM full scale: 50 % is the SACD reference, +3 dB gives 71 %",
+                                      260.f);
             static const std::wstring kLevels[] = {L"Standard", L"+3 dB"};
-            int lv = m.bridge.dsdHighLevel ? 1 : 0;
-            if (ui.Segmented(ui.MakeId(L"bridge-dsd-level"), c, kLevels, lv)) {
+            int lv = m.bridge.dsdHighLevel && !fixedEdge ? 1 : 0;
+            if (ui.Segmented(ui.MakeId(L"bridge-dsd-level"), c, kLevels, lv, !fixedEdge)) {
                 m.bridge.dsdHighLevel = lv == 1;
                 edited = true;
             }
         }
         {
-            // The rate in use when running, else the chosen one (0 = highest available: unknown here).
-            const uint32_t rate = running && (st.dop || st.nativeDsd) && st.dsdRate ? st.dsdRate : 44100u * m.bridge.dsdMultiple;
             const bool tooFast = rate > dsp::kLookAheadMaxRate;
             const Rect c = SettingRow(
                 ui, r, L"Modulator look-ahead",
-                tooFast ? L"Not available above DSD256"
-                        : L"Pruned tree search 64 bits ahead: stable closer to full scale",
+                fixedEdge ? L"Delta-sigma only: the fixed-edge modulator has its own 16-path search"
+                : tooFast ? L"Not available above DSD256"
+                          : L"Pruned tree search 64 bits ahead: stable closer to full scale",
                 260.f);
             static const std::wstring kModes[] = {L"Off", L"Standard", L"High"};
             int mode = static_cast<int>(m.bridge.dsdLookAhead);
-            if (ui.Segmented(ui.MakeId(L"bridge-dsd-lookahead"), c, kModes, mode)) {
+            if (ui.Segmented(ui.MakeId(L"bridge-dsd-lookahead"), c, kModes, mode, !fixedEdge)) {
                 m.bridge.dsdLookAhead = static_cast<dsp::LookAhead>(mode);
                 edited = true;
             }

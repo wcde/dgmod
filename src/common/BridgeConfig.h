@@ -60,6 +60,7 @@ struct BridgeConfig {
     uint32_t dsdMultiple = 0;        // DSD rate / 44.1 kHz: 64..256 (DoP), 64..1024 (native); 0 = highest the DAC accepts
     bool dsdHighLevel = false;       // DSD: PCM full scale -> 71 % modulation instead of 50 % (SACD reference)
     dsp::LookAhead dsdLookAhead = dsp::LookAhead::Off;  // DSD: pruned tree search of the modulator (up to DSD256)
+    dsp::DsdModulator dsdModulator = dsp::DsdModulator::DeltaSigma;  // DSD: fixed-edge at DSD256 only (50 % level)
     std::wstring asioDriver;         // native DSD: ASIO driver name; empty = the one matching the output device
     uint32_t bufferMs = 20;          // FIFO target between capture and render (latency vs. robustness)
     uint32_t periodMs = 0;           // output period; 0 = automatic (5 ms or the device minimum, DoP 10 ms, ASIO: the
