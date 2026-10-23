@@ -80,7 +80,7 @@ struct BridgeStatusData {
     double dsdNoiseBandHz = 0;                // DSD: band the modulator keeps its noise out of
     uint32_t dsdLookAheadPaths = 0;           // DSD: look-ahead paths of the modulator (0 = off)
     uint32_t dsdLookAheadDepth = 0;           // DSD: look-ahead depth in bits
-    uint32_t dsdFixedEdge = 0;                // DSD: the fixed-edge modulator is in use (no look-ahead then)
+    uint32_t dsdFixedEdge = 0;                // DSD: cell bits of the fixed-edge modulator in use (0 = delta-sigma)
     uint32_t limiter = 0;      // true-peak limiter active
     uint32_t warmth = 0;       // 0 = off, else 1 + dsp::WarmthType
     float warmthAmount = 0;    // 0..1

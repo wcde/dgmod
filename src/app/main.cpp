@@ -103,7 +103,7 @@ int PrintStatus() {
                               b.dop || b.nativeDsd
                                   ? std::format(L", noise shaped to {:.0f} kHz, {}, modulator resets={} clipped={}",
                                                 b.dsdNoiseBandHz / 1000.0,
-                                                b.dsdFixedEdge        ? std::wstring(L"fixed-edge modulator")
+                                                b.dsdFixedEdge        ? std::format(L"fixed-edge modulator, {}-bit cells", b.dsdFixedEdge)
                                                 : b.dsdLookAheadPaths ? std::format(L"look-ahead {} paths x {} bits",
                                                                                     b.dsdLookAheadPaths, b.dsdLookAheadDepth)
                                                                       : std::wstring(L"look-ahead off"),

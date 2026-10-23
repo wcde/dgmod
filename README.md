@@ -82,12 +82,13 @@ output rate. For DSD, a 7th-order 1-bit modulator reaches about 150 dB SNR in th
 DSD256/512, where it also keeps its noise out of the band up to 34 kHz (DSD256) or 50 kHz (DSD512). Peaks beyond its
 stable range are held by clipping its error feedback instead of resetting the loop (no click, only briefly more noise).
 
-At DSD256 the *Fixed-edge* modulator is an alternative for DACs that decode DSD bit by bit (a "1-bit" DSD mode rather
-than DSD-to-PCM conversion). It writes the stream as 24-bit cells, each made of a run of ones followed by a run of
-zeros. The rising edges then sit on a fixed 470.4 kHz grid, and each cell has exactly one falling edge, whatever the
-music. Any error the DAC makes at its edges becomes a fixed linear response plus an ultrasonic comb instead of
-distortion, without calibrating the DAC. Its own noise is about -124 dB in the audio band, and it always uses the 50 %
-level (stable up to 65 %).
+At DSD256 and DSD512 the *Fixed-edge* modulator is an alternative for DACs that decode DSD bit by bit (a "1-bit" DSD
+mode rather than DSD-to-PCM conversion). It writes the stream as 24-bit cells, each made of a run of ones followed by
+a run of zeros. The rising edges then sit on a fixed grid (470.4 kHz at DSD256, 940.8 kHz at DSD512), and each cell
+has exactly one falling edge, whatever the music. Any error the DAC makes at its edges becomes a fixed linear response
+plus an ultrasonic comb instead of distortion, without calibrating the DAC. Its own noise is about -124 dB (DSD256) or
+-164 dB (DSD512) in the audio band, and it always uses the 50 % level (stable up to 65 %). With AVX-512 it takes about
+a fifth (DSD256) or two fifths (DSD512) of a core per channel.
 
 ## Building
 

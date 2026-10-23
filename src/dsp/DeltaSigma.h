@@ -52,12 +52,13 @@ struct LookAheadShape {
 LookAheadShape LookAheadFor(LookAhead level, uint32_t dsdRate);
 
 // Modulator of the DSD encoder: the delta-sigma loop (with the look-ahead chosen), or the fixed-edge code for DACs that
-// decode the bits directly (FixedEdgeModulator; DSD256 only, the delta-sigma loop at other rates).
+// decode the bits directly (FixedEdgeModulator; DSD256 and DSD512, the delta-sigma loop at other rates).
 enum class DsdModulator : uint32_t { DeltaSigma = 0, FixedEdge = 1 };
 inline constexpr uint32_t kDsdModulators = 2;
 const wchar_t* DsdModulatorName(DsdModulator modulator);
 
 class FixedEdgeModulator;
+struct FixedEdgeShape;
 
 // 1-bit delta-sigma modulator in error-feedback form: v = u + (NTF - 1) e, y = sign(v), e = y - v. The NTF runs as a
 // cascade of second-order sections (numerically robust even with zeros and poles packed next to z = 1), so the
@@ -160,7 +161,8 @@ public:
     // audio band (0-20 kHz) and below -140 dB over the whole band, but never narrower than the source band (at most
     // 22.05 kHz): DSD256 and above keep the rise of the shaped noise away from the audio band and clear hi-res content
     // above 20 kHz of it; DSD64/128 have no margin and stay at 22.05 kHz.
-    // The fixed-edge modulator (at DSD256) uses its own NTF (FixedEdgeModulator) and ignores lookAhead, order, hinf.
+    // The fixed-edge modulator (at DSD256 and DSD512) uses its own NTF (FixedEdgeModulator) and ignores lookAhead,
+    // order and hinf.
     // With look-ahead or the fixed-edge modulator the channels are split between the calling thread and a helper
     // thread (see SetThreadWrapper).
     bool Configure(uint32_t channels, uint32_t frameRate, double bandHz, uint32_t maxFrames,
@@ -183,10 +185,11 @@ public:
     [[nodiscard]] double NoiseBandHz() const { return noiseBand_; }
     [[nodiscard]] LookAheadShape LookAheadUsed() const { return shape_; }
     [[nodiscard]] bool FixedEdgeUsed() const { return !fixedEdge_.empty(); }
+    // Cell shape of the fixed-edge code in use (nullptr: the delta-sigma loop), and whether it runs on AVX-512.
+    [[nodiscard]] const FixedEdgeShape* FixedEdgeShapeUsed() const;
+    [[nodiscard]] bool FixedEdgeAvx512() const;
     [[nodiscard]] bool LookAheadAvx512() const { return shape_.paths && modulators_[0].UsesAvx512(); }
-    void AllowAvx512(bool allow) {  // for tests
-        for (auto& m : modulators_) m.AllowAvx512(allow);
-    }
+    void AllowAvx512(bool allow);  // for tests
     void SetClipLevel(double clip) {  // for tests
         for (auto& m : modulators_) m.SetClipLevel(clip);
     }

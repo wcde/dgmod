@@ -915,11 +915,11 @@ bool DsdEncoder::Configure(uint32_t channels, uint32_t frameRate, double bandHz,
     modulators_.clear();
     fixedEdge_.clear();
     shape_ = {};
-    if (modulator == DsdModulator::FixedEdge && DsdRate() == FixedEdgeModulator::kRate) {
+    if (const FixedEdgeShape* fe = modulator == DsdModulator::FixedEdge ? FixedEdgeShapeFor(DsdRate()) : nullptr) {
         noiseBand_ = FixedEdgeModulator::kBandHz;
-        ntf_ = SynthesizeNtf(FixedEdgeModulator::kOrder, fs / (2.0 * noiseBand_), FixedEdgeModulator::kHinf);
+        ntf_ = SynthesizeNtf(FixedEdgeModulator::kOrder, fs / (2.0 * noiseBand_), fe->hinf);
         fixedEdge_.assign(channels, {});
-        for (auto& m : fixedEdge_) m.Configure(ntf_);
+        for (auto& m : fixedEdge_) m.Configure(ntf_, *fe);
     } else {
         const double floorBand = std::min(bandHz, 22050.0);
         noiseBand_ = floorBand;
@@ -961,8 +961,19 @@ void DsdEncoder::CopyStateFrom(const DsdEncoder& other) {
     for (uint32_t c = 0; c < channels_ && c < other.channels_; ++c) {
         std::copy_n(other.history_[c].begin(), taps_ - 1, history_[c].begin());
         if (c < modulators_.size()) modulators_[c] = other.modulators_[c];  // same section count: no allocation
-        if (c < fixedEdge_.size()) fixedEdge_[c] = other.fixedEdge_[c];
+        if (c < fixedEdge_.size()) fixedEdge_[c].CopyStateFrom(other.fixedEdge_[c]);
     }
+}
+
+const FixedEdgeShape* DsdEncoder::FixedEdgeShapeUsed() const {
+    return fixedEdge_.empty() ? nullptr : &fixedEdge_[0].Shape();
+}
+
+bool DsdEncoder::FixedEdgeAvx512() const { return !fixedEdge_.empty() && fixedEdge_[0].UsesAvx512(); }
+
+void DsdEncoder::AllowAvx512(bool allow) {
+    for (auto& m : modulators_) m.AllowAvx512(allow);
+    for (auto& m : fixedEdge_) m.AllowAvx512(allow);
 }
 
 uint64_t DsdEncoder::Resets() const {

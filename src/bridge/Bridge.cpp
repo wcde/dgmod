@@ -390,7 +390,7 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     base_.dsdNoiseBandHz = Dsd() ? dsd_.NoiseBandHz() : 0.0;
     base_.dsdLookAheadPaths = Dsd() ? dsd_.LookAheadUsed().paths : 0u;
     base_.dsdLookAheadDepth = Dsd() ? dsd_.LookAheadUsed().depth : 0u;
-    base_.dsdFixedEdge = Dsd() && dsd_.FixedEdgeUsed() ? 1u : 0u;
+    base_.dsdFixedEdge = Dsd() && dsd_.FixedEdgeUsed() ? dsd_.FixedEdgeShapeUsed()->cell : 0u;
     // The shape actually built (NOS is linear phase, and falls back to the slow roll-off without oversampling; the
     // equiripple design needs the two-stage cascade).
     const dsp::FilterSpec used = plan ? plan->filter.spec : dsp::FilterSpec{};
@@ -423,15 +423,17 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     if (Dsd()) {
         const dsp::LookAheadShape la = dsd_.LookAheadUsed();
         using dsp::FixedEdgeModulator;
+        const dsp::FixedEdgeShape* fe = dsd_.FixedEdgeShapeUsed();
         const std::wstring search =
-            dsd_.FixedEdgeUsed() ? std::format(L", fixed-edge {}-bit cells, {} paths x {} cells", FixedEdgeModulator::kCell,
-                                               FixedEdgeModulator::kPaths, FixedEdgeModulator::kDepth)
+            fe ? std::format(L", fixed-edge {}-bit cells (runs of {}+), {} paths x {} cells{}", fe->cell, fe->minRun,
+                             FixedEdgeModulator::kPaths, FixedEdgeModulator::kDepth,
+                             dsd_.FixedEdgeAvx512() ? L" (AVX-512)" : L"")
             : la.paths ? std::format(L", look-ahead {} paths x {} bits{}", la.paths, la.depth,
                                      dsd_.LookAheadAvx512() ? L" (AVX-512)" : L"")
             : cfg.dsdLookAhead != dsp::LookAhead::Off ? std::wstring(L", look-ahead off above DSD256")
                                                       : std::wstring();
         const wchar_t* fallback =
-            cfg.dsdModulator == dsp::DsdModulator::FixedEdge && !dsd_.FixedEdgeUsed() ? L", fixed-edge only at DSD256" : L"";
+            cfg.dsdModulator == dsp::DsdModulator::FixedEdge && !dsd_.FixedEdgeUsed() ? L", fixed-edge only at DSD256/512" : L"";
         dsp += std::format(L", {} DSD{} ({} Hz, modulator order {}{}{}, noise shaped to {:.0f} kHz, {} % level)",
                            dop_ ? L"DoP" : L"native", dsd_.DsdRate() / 44100, dsd_.DsdRate(), dsd_.Ntf().order, search,
                            fallback, dsd_.NoiseBandHz() / 1000.0, std::lround(dsdScale_ * 100.0f));

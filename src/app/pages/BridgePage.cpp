@@ -343,7 +343,7 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
                                    : response == dsp::FilterResponse::Slow     ? L"slow · " + base
                                    : response == dsp::FilterResponse::Gaussian ? L"Gaussian · " + base
                                                                                : base + design;
-        const std::wstring lookAhead = st.dsdFixedEdge        ? std::wstring(L" · fixed-edge")
+        const std::wstring lookAhead = st.dsdFixedEdge        ? std::format(L" · fixed-edge {}", st.dsdFixedEdge)
                                        : st.dsdLookAheadPaths ? std::format(L" · look-ahead {}", st.dsdLookAheadPaths)
                                                               : std::wstring();
         StatTile(ui, cols[1], L"Source → output",
@@ -495,13 +495,13 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
         // The rate in use when running, else the chosen one (0 = highest available: unknown here).
         const uint32_t rate = running && (st.dop || st.nativeDsd) && st.dsdRate ? st.dsdRate : 44100u * m.bridge.dsdMultiple;
         const bool fixedEdgeChosen = m.bridge.dsdModulator == dsp::DsdModulator::FixedEdge;
-        const bool fixedEdge = fixedEdgeChosen && rate == dsp::FixedEdgeModulator::kRate;
+        const bool fixedEdge = fixedEdgeChosen && dsp::FixedEdgeShapeFor(rate) != nullptr;
         {
             const Rect c = SettingRow(ui, r, L"Modulator",
                                       fixedEdgeChosen && !fixedEdge
-                                          ? (rate ? L"Fixed-edge needs DSD256: delta-sigma at this rate"
-                                                  : L"Fixed-edge needs DSD256: choose it as the DSD rate")
-                                          : L"Fixed-edge suits DACs in 1-bit DSD mode: immune to edge errors, DSD256 only",
+                                          ? (rate ? L"Fixed-edge needs DSD256 or DSD512: delta-sigma at this rate"
+                                                  : L"Fixed-edge needs DSD256 or DSD512: choose one as the DSD rate")
+                                          : L"Fixed-edge suits DACs in 1-bit DSD mode: immune to edge errors, DSD256/512",
                                       260.f);
             static const std::wstring kModulators[] = {L"Delta-sigma", L"Fixed-edge"};
             int mode = static_cast<int>(m.bridge.dsdModulator);
