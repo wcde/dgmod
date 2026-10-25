@@ -84,10 +84,10 @@ DpiSupport ModuleDpiSupport(HMODULE module) {
                                                 "DpiAwarenessContext", "SetProcessDpiAware", "ForDpi",
                                                 "GetScaleFactorForMonitor"};
     static constexpr std::string_view kWindow[] = {"CreateWindowEx", "DefWindowProc"};
-    static constexpr std::string_view kOpenGl[] = {"wglCreateContext", "wglMakeCurrent"};
+
     if (!module) return DpiSupport::Unknown;
     const auto* base = reinterpret_cast<const uint8_t*>(module);
-    bool aware = false, window = false, openGl = false;
+    bool aware = false, window = false;
     const uint32_t code = Guarded([&] {
         const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
@@ -107,13 +107,25 @@ DpiSupport ModuleDpiSupport(HMODULE module) {
                 }
             for (std::string_view name : kWindow)
                 if (!window && data.find(name) != std::string_view::npos) window = true;
-            for (std::string_view name : kOpenGl)
-                if (!openGl && data.find(name) != std::string_view::npos) openGl = true;
+
         }
     });
     if (code) return DpiSupport::Unknown;
-    return aware ? DpiSupport::Aware : openGl ? DpiSupport::OpenGl : window ? DpiSupport::Unaware : DpiSupport::Unknown;
+    return aware ? DpiSupport::Aware : window ? DpiSupport::Unaware : DpiSupport::Unknown;
 }
+
+namespace {
+std::atomic<bool> g_unawareThreads{false};
+
+// TLS callback: the loader runs it on every new thread before the thread's own code.
+void NTAPI OnThreadStart(PVOID, DWORD reason, PVOID) {
+    if (reason == DLL_THREAD_ATTACH && g_unawareThreads.load(std::memory_order_acquire))
+        ::SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED);
+}
+}  // namespace
+
+UnawareThreadsScope::UnawareThreadsScope() { g_unawareThreads.store(true, std::memory_order_release); }
+UnawareThreadsScope::~UnawareThreadsScope() { g_unawareThreads.store(false, std::memory_order_release); }
 
 std::wstring MissingDependencies(const std::wstring& binary) {
     // Map the image without resolving its imports, then look for every DLL it imports the way the loader would (the
@@ -155,3 +167,12 @@ PluginFileScan ScanPluginInProcess(const std::wstring& path) {
 }
 
 }  // namespace dgmod::plugins
+
+// Registers OnThreadStart in the executable's TLS directory (this object is always linked: the host uses it).
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:dgmod_thread_start_callback")
+extern "C" {
+#pragma const_seg(".CRT$XLB")
+extern const PIMAGE_TLS_CALLBACK dgmod_thread_start_callback = dgmod::plugins::OnThreadStart;
+#pragma const_seg()
+}

@@ -10,6 +10,7 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <optional>
 
 namespace dgmod::plugins {
 
@@ -548,14 +549,14 @@ void PluginHost::OpenEditor(uint32_t id) {
     }
     // Editors draw at the monitor's DPI (VST 3 gets the content scale, VST 2 editors find it themselves), as in an
     // audio workstation. An editor that cannot scale, or one the user chose so for, gets a window Windows scales:
-    // one whose binary never asks for a DPI, or a VST 3 one without content scaling unless its binary handles DPI
-    // itself or draws with OpenGL (either breaks in a scaled window: better crisp at its own size).
-    const bool scaled = !inst->entry.windowsScaling;
-    if (!CreateEditor(*inst, scaled)) return;
+    // one whose binary never asks for a DPI (known before it opens, so its threads start unaware from the outset), or
+    // a VST 3 one without content scaling whose binary cannot be judged. A binary that handles DPI itself draws in
+    // physical pixels and stays crisp at its own size.
     const DpiSupport dpi = inst->plugin->BinaryDpi();
-    const bool cannotScale = !inst->plugin->EditorScales() &&
-                             (dpi == DpiSupport::Unaware || (dpi == DpiSupport::Unknown && inst->entry.format == PluginFormat::Vst3));
-    if (scaled && cannotScale && ::GetDpiForWindow(inst->editor) != USER_DEFAULT_SCREEN_DPI) {
+    const bool scaled = !inst->entry.windowsScaling && dpi != DpiSupport::Unaware;
+    if (!CreateEditor(*inst, scaled)) return;
+    if (scaled && dpi == DpiSupport::Unknown && inst->entry.format == PluginFormat::Vst3 && !inst->plugin->EditorScales() &&
+        ::GetDpiForWindow(inst->editor) != USER_DEFAULT_SCREEN_DPI) {
         CloseEditor(*inst);
         CreateEditor(*inst, false);
     }
@@ -563,6 +564,8 @@ void PluginHost::OpenEditor(uint32_t id) {
 }
 
 bool PluginHost::CreateEditor(Instance& inst, bool scaled) {
+    std::optional<UnawareThreadsScope> unawareThreads;
+    if (!scaled) unawareThreads.emplace();
     // A Windows-scaled window may host child windows the plug-in creates with another DPI awareness.
     const DPI_HOSTING_BEHAVIOR previousHosting =
         ::SetThreadDpiHostingBehavior(scaled ? DPI_HOSTING_BEHAVIOR_DEFAULT : DPI_HOSTING_BEHAVIOR_MIXED);

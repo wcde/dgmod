@@ -33,7 +33,7 @@ std::wstring ExceptionName(uint32_t code);
 
 class PluginInstance;
 
-enum class DpiSupport : uint8_t { Unknown, Aware, Unaware, OpenGl };
+enum class DpiSupport : uint8_t { Unknown, Aware, Unaware };
 
 // Notifications from an instance to its host.
 struct PluginCallbacks {
@@ -156,9 +156,19 @@ HMODULE LoadPluginModule(const std::wstring& binary, std::wstring& error);
 std::wstring MissingDependencies(const std::wstring& binary);
 // Judges a loaded plug-in binary by the Win32 functions it names (imports or looks up): Aware = it asks for DPIs and
 // draws in physical pixels itself (Windows scaling its window breaks it), Unaware = a GUI that never does (it draws
-// at 96 dpi), OpenGl = one that never does but draws with OpenGL (in a scaled window of this per-monitor aware
-// process the driver sizes the surface in physical pixels: the editor fills only a corner of it), Unknown = no window
-// functions named either (packed or protected code, or a loader stub).
+// at 96 dpi), Unknown = no window functions named either (packed or protected code, or a loader stub).
 DpiSupport ModuleDpiSupport(HMODULE module);
+
+// While one lives, threads that start anywhere in the process begin DPI-unaware instead of per-monitor aware (the
+// process default). Wraps opening an editor in a window Windows scales: an OpenGL driver sizes the surface of such a
+// window from its own threads (they start with the editor), and per-monitor aware ones see physical pixels, so the
+// editor would fill only a corner of the window. Host thread only; no nesting.
+class UnawareThreadsScope {
+public:
+    UnawareThreadsScope();
+    ~UnawareThreadsScope();
+    UnawareThreadsScope(const UnawareThreadsScope&) = delete;
+    UnawareThreadsScope& operator=(const UnawareThreadsScope&) = delete;
+};
 
 }  // namespace dgmod::plugins

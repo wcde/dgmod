@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <optional>
 #include <atomic>
 #include <string>
 #include <thread>
@@ -216,7 +217,10 @@ int PluginTestCommand(const std::vector<std::wstring>& args, const std::function
 
     const std::wstring editorSec = ArgAfter(args, L"--editor");
     if (!editorSec.empty() && p.HasEditor()) {
-        const bool scaled = !HasFlag(args, L"--windows-scaling");
+        // As the bridge decides it (PluginHost::OpenEditor), except the VST 3 retry for a binary it cannot judge.
+        const bool scaled = !HasFlag(args, L"--windows-scaling") && p.BinaryDpi() != plugins::DpiSupport::Unaware;
+        std::optional<plugins::UnawareThreadsScope> unawareThreads;
+        if (!scaled) unawareThreads.emplace();
         const DPI_HOSTING_BEHAVIOR prevHosting =
             ::SetThreadDpiHostingBehavior(scaled ? DPI_HOSTING_BEHAVIOR_DEFAULT : DPI_HOSTING_BEHAVIOR_MIXED);
         const DPI_AWARENESS_CONTEXT prev = ::SetThreadDpiAwarenessContext(
@@ -240,6 +244,7 @@ int PluginTestCommand(const std::vector<std::wstring>& args, const std::function
         cb.editor = w;
         const float scale = scaled ? float(::GetDpiForWindow(w)) / 96.0f : 1.0f;
         auto size = p.OpenEditor(w, scale);
+        unawareThreads.reset();
         if (!size) {
             print(L"editor failed: " + size.error().Message());
         } else {
@@ -250,7 +255,7 @@ int PluginTestCommand(const std::vector<std::wstring>& args, const std::function
                               p.EditorScales() ? L"yes" : L"no",
                               dpi == plugins::DpiSupport::Aware     ? L"DPI-aware"
                               : dpi == plugins::DpiSupport::Unaware ? L"DPI-unaware"
-                              : dpi == plugins::DpiSupport::OpenGl  ? L"DPI-unaware OpenGL"
+
                                                                     : L"unknown",
                               p.EditorResizable() ? L"yes" : L"no"));
             const ULONGLONG end = ::GetTickCount64() + ULONGLONG(_wtof(editorSec.c_str()) * 1000.0);
