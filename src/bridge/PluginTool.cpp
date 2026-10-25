@@ -2,9 +2,9 @@
 //
 //   --scan-plugin <path>   lists the effect classes of a plug-in file (the GUI runs this per file: a plug-in that
 //                          crashes while loading only takes this process down)
-//   --plugin-test <path> [--class <id>] [--editor <seconds>] [--capture <file.png>] [--desktop <n>]
+//   --plugin-test <path> [--class <id>] [--editor <seconds>] [--capture <file.png>] [--hidden] [--windows-scaling]
 //                          loads one plug-in the way the bridge does, processes 2 s of test signal at 48 kHz, checks
-//                          its state round trip and optionally opens its editor (on virtual desktop n, captured to PNG)
+//                          its state round trip and optionally opens its editor (optionally hidden, captured to PNG)
 //   --plugin-host-test <path>...
 //                          runs the bridge's plug-in host on a test chain (HKCU\Software\dgmod\PluginsTest): loads,
 //                          activates and processes the plug-ins in real time while the chain is edited (bypass, reorder,
@@ -17,7 +17,7 @@
 #include "plugins/Plugin.h"
 #include "plugins/PluginHost.h"
 
-#include <shobjidl.h>
+#include <dwmapi.h>
 #include <wincodec.h>
 #include <xmmintrin.h>
 
@@ -57,21 +57,29 @@ struct NullCallbacks final : plugins::PluginCallbacks {
     void RestartRequested(plugins::PluginInstance&) override { ++restarts; }
 };
 
-bool MoveToDesktop(HWND w, int desktop) {
-    auto key = std::wstring(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops");
-    HKEY k = nullptr;
-    if (::RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
-    BYTE ids[16 * 32]{};
-    DWORD size = sizeof(ids);
-    const LSTATUS st = ::RegQueryValueExW(k, L"VirtualDesktopIDs", nullptr, nullptr, ids, &size);
-    ::RegCloseKey(k);
-    if (st != ERROR_SUCCESS || size < DWORD(desktop) * 16 || desktop < 1) return false;
-    GUID id;
-    std::memcpy(&id, ids + (desktop - 1) * 16, 16);
-    constexpr CLSID kVirtualDesktopManager = {0xAA509086, 0x5CA9, 0x4C25, {0x8F, 0x95, 0x58, 0x9D, 0x3C, 0x07, 0xB4, 0x8A}};
-    ComPtr<IVirtualDesktopManager> m;
-    if (FAILED(::CoCreateInstance(kVirtualDesktopManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&m)))) return false;
-    return SUCCEEDED(m->MoveWindowToDesktop(w, id));
+// Prints the windows the plug-in created inside the editor window with their size and DPI awareness.
+void PrintChildWindows(HWND parent, const std::function<void(const std::wstring&)>& print) {
+    struct Ctx {
+        HWND parent;
+        const std::function<void(const std::wstring&)>* print;
+    } ctx{parent, &print};
+    ::EnumChildWindows(
+        parent,
+        [](HWND c, LPARAM lp) -> BOOL {
+            auto& x = *reinterpret_cast<Ctx*>(lp);
+            wchar_t cls[96]{};
+            ::GetClassNameW(c, cls, 96);
+            RECT r{};
+            ::GetClientRect(c, &r);
+            int depth = 0;
+            for (HWND p = ::GetParent(c); p && p != x.parent; p = ::GetParent(p)) ++depth;
+            const DPI_AWARENESS a = ::GetAwarenessFromDpiAwarenessContext(::GetWindowDpiAwarenessContext(c));
+            const wchar_t* aware = a == DPI_AWARENESS_UNAWARE ? L"unaware" : a == DPI_AWARENESS_SYSTEM_AWARE ? L"system" : L"per-monitor";
+            (*x.print)(std::format(L"  {}child {} {}x{}, {}, dpi {}{}", std::wstring(size_t(depth) * 2, L' '), cls, r.right, r.bottom,
+                                   aware, ::GetDpiForWindow(c), ::IsWindowVisible(c) ? L"" : L", hidden"));
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
 }
 
 bool CapturePng(HWND w, const std::wstring& path) {
@@ -130,7 +138,7 @@ int PluginTestCommand(const std::vector<std::wstring>& args, const std::function
     size_t at = 0;
     while (at < args.size() && args[at] != L"--plugin-test") ++at;
     if (at + 1 >= args.size()) {
-        print(L"usage: --plugin-test <path> [--class <id>] [--editor <seconds>] [--capture <file.png>] [--desktop <n>]");
+        print(L"usage: --plugin-test <path> [--class <id>] [--editor <seconds>] [--capture <file.png>] [--hidden] [--windows-scaling]");
         return 1;
     }
     PluginEntry e;
@@ -219,11 +227,16 @@ int PluginTestCommand(const std::vector<std::wstring>& args, const std::function
         wc.hbrBackground = static_cast<HBRUSH>(::GetStockObject(BLACK_BRUSH));
         wc.lpszClassName = L"dgmodPluginTest";
         ::RegisterClassW(&wc);
-        HWND w = ::CreateWindowExW(0, wc.lpszClassName, (p.Name() + L" — dgmod test").c_str(),
-                                   WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, 100, 100, 400, 300, nullptr, nullptr,
-                                   wc.hInstance, nullptr);
-        const int desktop = _wtoi(ArgAfter(args, L"--desktop").c_str());
-        if (desktop > 0) print(MoveToDesktop(w, desktop) ? std::format(L"editor window on desktop {}", desktop) : L"desktop move failed");
+        // Hidden: cloaked, as a window on another virtual desktop is, so the compositor still renders it for the capture
+        // (an off-screen OpenGL editor does not draw); off the taskbar and never activated.
+        const bool hidden = HasFlag(args, L"--hidden");
+        HWND w = ::CreateWindowExW(hidden ? WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE : 0, wc.lpszClassName,
+                                   (p.Name() + L" — dgmod test").c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, 100,
+                                   100, 400, 300, nullptr, nullptr, wc.hInstance, nullptr);
+        if (hidden) {
+            const BOOL cloak = TRUE;
+            if (FAILED(::DwmSetWindowAttribute(w, DWMWA_CLOAK, &cloak, sizeof(cloak)))) print(L"cloaking failed");
+        }
         cb.editor = w;
         const float scale = scaled ? float(::GetDpiForWindow(w)) / 96.0f : 1.0f;
         auto size = p.OpenEditor(w, scale);
@@ -232,8 +245,14 @@ int PluginTestCommand(const std::vector<std::wstring>& args, const std::function
         } else {
             cb.EditorResizeRequest(p, size->cx, size->cy);
             ::ShowWindow(w, SW_SHOWNOACTIVATE);
-            print(std::format(L"editor {}x{} (scale {:.2f}, scales itself: {}, resizable: {})", size->cx, size->cy, scale,
-                              p.EditorScales() ? L"yes" : L"no", p.EditorResizable() ? L"yes" : L"no"));
+            const plugins::DpiSupport dpi = p.BinaryDpi();
+            print(std::format(L"editor {}x{} (scale {:.2f}, scales itself: {}, binary: {}, resizable: {})", size->cx, size->cy, scale,
+                              p.EditorScales() ? L"yes" : L"no",
+                              dpi == plugins::DpiSupport::Aware     ? L"DPI-aware"
+                              : dpi == plugins::DpiSupport::Unaware ? L"DPI-unaware"
+                              : dpi == plugins::DpiSupport::OpenGl  ? L"DPI-unaware OpenGL"
+                                                                    : L"unknown",
+                              p.EditorResizable() ? L"yes" : L"no"));
             const ULONGLONG end = ::GetTickCount64() + ULONGLONG(_wtof(editorSec.c_str()) * 1000.0);
             while (::GetTickCount64() < end && !p.Crashed()) {
                 MSG msg;
@@ -246,6 +265,7 @@ int PluginTestCommand(const std::vector<std::wstring>& args, const std::function
                 p.Process(inPtr, outPtr, kChannels, kBlock);
                 ::Sleep(10);
             }
+            PrintChildWindows(w, print);
             const std::wstring capture = ArgAfter(args, L"--capture");
             if (!capture.empty()) print(CapturePng(w, capture) ? L"captured " + capture : std::wstring(L"capture failed"));
             p.CloseEditor();

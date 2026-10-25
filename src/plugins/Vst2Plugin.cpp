@@ -80,6 +80,7 @@ public:
         std::wstring error;
         module_ = LoadPluginModule(path, error);
         if (!module_) return Fail(E_FAIL, error);
+        binaryDpi_ = ModuleDpiSupport(module_);
         const int32_t id = shellId.empty() ? 0 : static_cast<int32_t>(std::wcstoul(shellId.c_str(), nullptr, 10));
         effect_ = OpenEffect(module_, id, error);
         if (!effect_) return Fail(E_FAIL, error);

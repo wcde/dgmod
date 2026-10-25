@@ -33,6 +33,8 @@ std::wstring ExceptionName(uint32_t code);
 
 class PluginInstance;
 
+enum class DpiSupport : uint8_t { Unknown, Aware, Unaware, OpenGl };
+
 // Notifications from an instance to its host.
 struct PluginCallbacks {
     virtual ~PluginCallbacks() = default;
@@ -84,6 +86,8 @@ public:
     [[nodiscard]] virtual bool EditorResizable() const { return false; }
     // The editor follows the window's DPI (VST 3 content scaling); false = it draws at 96 dpi.
     [[nodiscard]] virtual bool EditorScales() const { return false; }
+    // Whether the plug-in's binary handles DPI itself (see ModuleDpiSupport).
+    [[nodiscard]] DpiSupport BinaryDpi() const { return binaryDpi_; }
     // Nearest size the editor accepts (resizable editors).
     virtual SIZE ConstrainEditorSize(SIZE s) { return s; }
     // The window was resized by the user / its DPI changed.
@@ -122,6 +126,7 @@ protected:
     bool active_ = false;
     ProcessFormat processFormat_{};
     uint32_t latency_ = 0, inputs_ = 0, outputs_ = 0;
+    DpiSupport binaryDpi_ = DpiSupport::Unknown;
     PluginCallbacks* callbacks_ = nullptr;
 
 private:
@@ -149,5 +154,11 @@ void MapOutput(const float* const* busOut, uint32_t busChannels, const float* co
 HMODULE LoadPluginModule(const std::wstring& binary, std::wstring& error);
 // The DLLs a binary imports that cannot be found (comma-separated), for a clear "not installed" message.
 std::wstring MissingDependencies(const std::wstring& binary);
+// Judges a loaded plug-in binary by the Win32 functions it names (imports or looks up): Aware = it asks for DPIs and
+// draws in physical pixels itself (Windows scaling its window breaks it), Unaware = a GUI that never does (it draws
+// at 96 dpi), OpenGl = one that never does but draws with OpenGL (in a scaled window of this per-monitor aware
+// process the driver sizes the surface in physical pixels: the editor fills only a corner of it), Unknown = no window
+// functions named either (packed or protected code, or a loader stub).
+DpiSupport ModuleDpiSupport(HMODULE module);
 
 }  // namespace dgmod::plugins

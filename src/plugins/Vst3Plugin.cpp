@@ -384,6 +384,7 @@ public:
         std::wstring error;
         module_ = LoadPluginModule(PluginBinaryPath(path), error);
         if (!module_) return Fail(E_FAIL, error);
+        binaryDpi_ = ModuleDpiSupport(module_);
         auto getFactory = reinterpret_cast<GetFactoryProc>(::GetProcAddress(module_, "GetPluginFactory"));
         if (!getFactory) return Fail(E_FAIL, L"Not a VST 3 plug-in (no GetPluginFactory)");
         bool ok = true;

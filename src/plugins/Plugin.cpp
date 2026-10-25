@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <format>
+#include <string_view>
 
 namespace dgmod::plugins {
 
@@ -74,6 +75,44 @@ HMODULE LoadPluginModule(const std::wstring& binary, std::wstring& error) {
                 error = L"The plug-in needs " + missing + L", not installed (reinstall the plug-in)";
     }
     return m;
+}
+
+DpiSupport ModuleDpiSupport(HMODULE module) {
+    // Names of the per-monitor DPI functions (prefixes cover their variants) and of the window functions every
+    // editor uses. They live in the import table or as GetProcAddress strings, in the initialized data sections.
+    static constexpr std::string_view kDpi[] = {"GetDpiForWindow",    "GetDpiForMonitor", "GetDpiForSystem",
+                                                "DpiAwarenessContext", "SetProcessDpiAware", "ForDpi",
+                                                "GetScaleFactorForMonitor"};
+    static constexpr std::string_view kWindow[] = {"CreateWindowEx", "DefWindowProc"};
+    static constexpr std::string_view kOpenGl[] = {"wglCreateContext", "wglMakeCurrent"};
+    if (!module) return DpiSupport::Unknown;
+    const auto* base = reinterpret_cast<const uint8_t*>(module);
+    bool aware = false, window = false, openGl = false;
+    const uint32_t code = Guarded([&] {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+        const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections && !aware; ++i, ++sec) {
+            if (!(sec->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) || (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+                !(sec->Characteristics & IMAGE_SCN_MEM_READ))
+                continue;
+            const std::string_view data(reinterpret_cast<const char*>(base + sec->VirtualAddress),
+                                        std::min(sec->Misc.VirtualSize, sec->SizeOfRawData));
+            for (std::string_view name : kDpi)
+                if (data.find(name) != std::string_view::npos) {
+                    aware = true;
+                    break;
+                }
+            for (std::string_view name : kWindow)
+                if (!window && data.find(name) != std::string_view::npos) window = true;
+            for (std::string_view name : kOpenGl)
+                if (!openGl && data.find(name) != std::string_view::npos) openGl = true;
+        }
+    });
+    if (code) return DpiSupport::Unknown;
+    return aware ? DpiSupport::Aware : openGl ? DpiSupport::OpenGl : window ? DpiSupport::Unaware : DpiSupport::Unknown;
 }
 
 std::wstring MissingDependencies(const std::wstring& binary) {

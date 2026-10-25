@@ -12,7 +12,7 @@
 //                             channels and clocks
 //   dgmod-bridge.exe --scan-plugin <path>
 //                             list the effect classes of a VST 3 / VST 2 plug-in file (run by the GUI for every file)
-//   dgmod-bridge.exe --plugin-test <path> [--class <id>] [--editor <seconds>] [--capture <png>] [--desktop <n>]
+//   dgmod-bridge.exe --plugin-test <path> [--class <id>] [--editor <seconds>] [--capture <png>] [--hidden] [--windows-scaling]
 //                             load one plug-in as the bridge does, process a test signal, check its state round trip
 //                             and optionally show its editor
 
