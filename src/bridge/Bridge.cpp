@@ -241,6 +241,7 @@ void BridgeEngine::Run(HANDLE stopEvent, HANDLE reloadEvent, BridgeStatusMapping
             asioTimingError_.clear();  // another driver, rate or buffer: native DSD may be tried again
         cfg = std::move(next);
     }
+    asio_.Close();
 
     // Give the default playback device back.
     const BridgeConfig latest = LoadBridgeConfig();
@@ -276,6 +277,7 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     PublishStatus();
 
     auto wait = [&](const std::wstring& why) {
+        asio_.Close();  // a stream kept from the session before: the DAC is free while waiting
         SetState(BridgeState::Waiting, why);
         PublishStatus();
         Log(L"waiting: " + why);
@@ -297,7 +299,6 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     if (cfg.NativeDsd() && !cfg.bypass && !asioTimingError_.empty()) return wait(asioTimingError_);
     if (auto r = OpenCapture(cfg); !r) return wait(r.error().Message());
     if (auto r = OpenRender(cfg); !r) {
-        asio_.Close();
         captureClient_.Reset();
         capture_.Reset();
         return wait(r.error().Message());
@@ -512,7 +513,10 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     ::SetEvent(quitEvent_.Get());
     capture.join();
     render.join();
-    asio_.Close();
+    // Applying new settings: the native DSD stream keeps running on DSD silence for the next session to take over
+    // (closed there if it needs other driver settings), unless the driver itself asked to be re-opened.
+    if (end != SessionEnd::Reload || asio_.ResetRequested()) asio_.Close();
+    else if (native_) asio_.EndFeed();
     if (renderClient_) renderClient_->Stop();
     if (captureClient_) captureClient_->Stop();
     render_.Reset();
@@ -598,11 +602,15 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     // Automatic: the driver's own buffer setting. The render thread keeps AsioDsdOutput::QueueDepth() buffers queued
     // ahead of the driver.
     req.periodMs = double(cfg.periodMs);
-    uint32_t mask = 0;
-    auto opened = asio_.Open(req, mask);
+    // Same driver settings as the session before: its stream still runs (DSD silence since that session faded out) and
+    // is taken over, so the DAC does not drop and re-lock its input (an audible click) on every settings change.
+    const bool kept = asio_.Running(req);
+    uint32_t mask = kept ? asio_.Info().supportedMask : 0;
+    auto opened = kept ? Result<AsioDsdOutput::Opened>(asio_.Info()) : asio_.Open(req, mask);
     base_.asioDsdMask = mask;
     if (!opened) return std::unexpected(opened.error());
     const AsioDsdOutput::Opened& o = *opened;
+    asioBase_ = {asio_.LateSwitches(), asio_.MissingEmergencies(), asio_.Resyncs(), asio_.Overloads()};
     native_ = true;
     dop_ = false;
     deviceChannels_ = o.deviceChannels;
@@ -617,9 +625,9 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     // emergency fade-out.
     base_.deviceLatencyMs = std::max(0.0, o.outputLatencyMs - base_.periodMs) +
                             (asio_.QueueDepth() - 1) * base_.periodMs + std::min(double(kDeclickMs), base_.periodMs);
-    Log(std::format(L"asio: \"{}\" ({}), DSD{} native, {} of {} outputs, {} samples/buffer ({:.2f} ms, {} queued ahead), {}, "
+    Log(std::format(L"asio: {}\"{}\" ({}), DSD{} native, {} of {} outputs, {} samples/buffer ({:.2f} ms, {} queued ahead), {}, "
                     L"output latency {:.2f} ms, outputReady {}, accepts{}{}{}{}{}",
-                    driver->name, o.driverName, o.dsdMultiple, o.channels, o.deviceChannels, o.bufferSamples, base_.periodMs,
+                    kept ? L"kept running " : L"", driver->name, o.driverName, o.dsdMultiple, o.channels, o.deviceChannels, o.bufferSamples, base_.periodMs,
                     asio_.QueueDepth(),
                     o.lsbFirst ? L"LSB first" : L"MSB first", o.outputLatencyMs, o.outputReady ? L"yes" : L"no",
                     (mask & DsdMaskBit(64)) ? L" DSD64" : L"", (mask & DsdMaskBit(128)) ? L" DSD128" : L"",
@@ -650,6 +658,7 @@ Result<void> BridgeEngine::OpenRender(const BridgeConfig& cfg) {
     native_ = false;
     dop_ = false;
     if (cfg.NativeDsd() && !cfg.bypass) return OpenAsio(cfg);
+    asio_.Close();  // a stream kept from a native DSD session holds the DAC
     ComPtr<IMMDevice> dev;
     if (FAILED(enumerator_->GetDevice(cfg.outputId.c_str(), &dev))) return dgmod::Fail(E_FAIL, L"Output device not found");
     DWORD state = 0;
@@ -1088,7 +1097,10 @@ void BridgeEngine::RenderThread() {
 void BridgeEngine::LogGlitches() {
     const GlitchSnapshot now{underruns_.load(),       resyncs_.load(),     overruns_.load(),    discontinuities_.load(),
                              modulatorResets_.load(), lateWakeups_.load(), slowPeriods_.load(), badSamples_.load(),
-                             native_ ? asio_.LateSwitches() : 0,          native_ ? asio_.MissingEmergencies() : 0};
+                             native_ ? asio_.LateSwitches() - asioBase_.lateSwitches : 0,
+                             native_ ? asio_.MissingEmergencies() - asioBase_.missingEmergencies : 0,
+                             native_ ? asio_.Resyncs() - asioBase_.resyncs : 0,
+                             native_ ? asio_.Overloads() - asioBase_.overloads : 0};
     auto delta = [](const wchar_t* name, uint64_t a, uint64_t b) {
         return a > b ? std::format(L" {} +{}", name, a - b) : std::wstring();
     };
@@ -1100,7 +1112,9 @@ void BridgeEngine::LogGlitches() {
                         delta(L"slow periods", now.slow, logged_.slow) +
                         delta(L"invalid samples replaced", now.badSamples, logged_.badSamples) +
                         delta(L"ASIO buffers missed", now.lateSwitches, logged_.lateSwitches) +
-                        delta(L"of them without a fade-out", now.missingEmergencies, logged_.missingEmergencies);
+                        delta(L"of them without a fade-out", now.missingEmergencies, logged_.missingEmergencies) +
+                        delta(L"ASIO driver resyncs", now.asioResyncs, logged_.asioResyncs) +
+                        delta(L"ASIO driver overloads", now.asioOverloads, logged_.asioOverloads);
     if (what.empty()) return;
     logged_ = now;
     Log(std::format(L"glitch:{} (longest wake-up gap {:.1f} ms, period {:.1f} ms, fifo {:.1f} ms)", what,
@@ -1274,7 +1288,7 @@ void BridgeEngine::PublishStatus() {
                                  d.deviceLatencyMs + d.pluginLatencyMs
                            : 0.0;
     d.lateWakeups = lateWakeups_.load();
-    if (native_) d.lateSwitches = asio_.LateSwitches();
+    if (native_) d.lateSwitches = asio_.LateSwitches() - asioBase_.lateSwitches;
     d.slowPeriods = slowPeriods_.load();
     {
         const uint64_t gap = maxWakeGap_.exchange(0);

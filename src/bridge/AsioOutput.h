@@ -73,6 +73,11 @@ public:
     // Loads the driver, switches it to DSD, sets the rate, creates the buffers (both halves hold DSD silence).
     // `supportedMask` is filled even when opening fails later (0 if the driver has no DSD mode).
     Result<Opened> Open(const Request& request, uint32_t& supportedMask);
+    // The stream is running for an equal request and the driver asked for no restart: a new session may take it over
+    // (Info() describes it) instead of re-opening the driver, so the DAC never loses its input.
+    [[nodiscard]] bool Running(const Request& request) const;
+    [[nodiscard]] const Opened& Info() const { return opened_; }
+    // Starts the stream (no-op if it runs).
     Result<void> Start();
     // Stops the stream and unloads the driver (safe to call at any time).
     void Close();
@@ -96,10 +101,16 @@ public:
     // Push. Until then the slot has no continuation: a dry queue right after it plays DSD silence instead.
     bool Push(const uint16_t* words, const uint16_t* emergency, uint32_t channels, uint64_t epoch, uint64_t* seq = nullptr);
     void SetEmergency(uint64_t seq, const uint16_t* emergency, uint32_t channels);
+    // The producer stopped on purpose (the stream is kept running for the next one): the queue running dry until the
+    // next Push is not a missed buffer.
+    void EndFeed();
 
     // Any thread.
     [[nodiscard]] HANDLE ResetEvent() const { return resetEvent_.Get(); }  // the driver asked to be re-opened
+    [[nodiscard]] bool ResetRequested() const;
     [[nodiscard]] std::wstring ResetReason() const;
+    // kAsioResyncRequest messages: the driver lost the stream (USB dropout, clock slip) and resynchronized.
+    [[nodiscard]] uint64_t Resyncs() const { return resyncs_.load(std::memory_order_relaxed); }
     // Buffer switches that found no queued buffer after playback had begun (covered by a fade-out to silence).
     [[nodiscard]] uint64_t LateSwitches() const { return late_.load(std::memory_order_relaxed); }
     // Of those, the ones whose emergency continuation was not attached yet (cut to DSD silence).
@@ -131,6 +142,7 @@ private:
     Driver* driver_ = nullptr;  // IASIO*, used on the STA thread (and outputReady on the callback thread)
     HWND window_ = nullptr;     // sysHandle for init(), owned by the STA thread
     bool buffersCreated_ = false, started_ = false;
+    Request request_{};
     Opened opened_{};
     std::vector<std::array<void*, 2>> buffers_;
     uint32_t bytesPerBuffer_ = 0;
@@ -144,11 +156,12 @@ private:
     mutable std::mutex queueMutex_;  // held for a few microseconds by either side
     uint64_t head_ = 0, tail_ = 0;
     bool emergencyReady_ = false;  // slot tail_ - 1 was played and its emergency continuation not yet
+    bool fed_ = true;              // EndFeed() was not called since the last Push
     std::array<uint64_t, kSlots> emergencySeq_{};  // per slot: the push whose continuation it holds (~0 = none)
     std::atomic<uint64_t> epoch_{0};
 
     UniqueHandle switchEvent_, resetEvent_;
-    std::atomic<uint64_t> switchSeq_{0}, late_{0}, missing_{0}, overloads_{0};
+    std::atomic<uint64_t> switchSeq_{0}, late_{0}, missing_{0}, overloads_{0}, resyncs_{0};
     std::atomic<int64_t> firstSwitchQpc_{0}, lastSwitchQpc_{0};
     std::atomic<uint64_t> timedSwitches_{0};
     double qpcFreq_ = 1;

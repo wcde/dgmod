@@ -242,12 +242,14 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
     qpcFreq_ = double(f.QuadPart);
     switchEvent_.Reset(::CreateEventW(nullptr, FALSE, FALSE, nullptr));
     resetEvent_.Reset(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    switchSeq_ = late_ = missing_ = overloads_ = timedSwitches_ = 0;
+    switchSeq_ = late_ = missing_ = overloads_ = resyncs_ = timedSwitches_ = 0;
+    request_ = req;
     firstSwitchQpc_ = lastSwitchQpc_ = 0;
     {
         std::lock_guard lock(queueMutex_);
         head_ = tail_ = 0;
         emergencyReady_ = false;
+        fed_ = true;
         emergencySeq_.fill(~uint64_t{0});
         epoch_ = 0;
     }
@@ -386,8 +388,18 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
     return result;
 }
 
+bool AsioDsdOutput::Running(const Request& req) const {
+    return sta_ && driver_ && buffersCreated_ && started_ && !ResetRequested() && ::IsEqualGUID(req.clsid, request_.clsid) &&
+           req.dsdMultiple == request_.dsdMultiple && req.channels == request_.channels && req.periodMs == request_.periodMs;
+}
+
+bool AsioDsdOutput::ResetRequested() const {
+    return resetEvent_ && ::WaitForSingleObject(resetEvent_.Get(), 0) == WAIT_OBJECT_0;
+}
+
 Result<void> AsioDsdOutput::Start() {
     if (!sta_ || !driver_ || !buffersCreated_) return dgmod::Fail(E_UNEXPECTED, L"ASIO: not open");
+    if (started_) return {};
     ASIOError e = ASE_OK;
     sta_->Run([&] {
         e = driver_->start();
@@ -503,7 +515,13 @@ bool AsioDsdOutput::Push(const uint16_t* words, const uint16_t* emergency, uint3
     if (emergency) emergencySeq_[slot % kSlots] = slot;
     if (seq) *seq = slot;
     ++head_;
+    fed_ = true;
     return true;
+}
+
+void AsioDsdOutput::EndFeed() {
+    std::lock_guard lock(queueMutex_);
+    fed_ = false;
 }
 
 void AsioDsdOutput::SetEmergency(uint64_t seq, const uint16_t* emergency, uint32_t channels) {
@@ -563,8 +581,8 @@ void AsioDsdOutput::OnSwitch(long index) {
             const bool attached = emergencyReady_ && emergencySeq_[(tail_ - 1) % kSlots] == tail_ - 1;
             if (attached) CopySlot(Slot(tail_ - 1, true), index);
             else FillSilence(index);
-            if (emergencyReady_) late_.fetch_add(1, std::memory_order_relaxed);
-            if (emergencyReady_ && !attached) missing_.fetch_add(1, std::memory_order_relaxed);
+            if (emergencyReady_ && fed_) late_.fetch_add(1, std::memory_order_relaxed);
+            if (emergencyReady_ && fed_ && !attached) missing_.fetch_add(1, std::memory_order_relaxed);
             emergencyReady_ = false;
             epoch_.fetch_add(1, std::memory_order_release);
         }
@@ -583,7 +601,7 @@ long AsioDsdOutput::OnMessage(long selector, long value) {
         case kAsioEngineVersion: return 2;
         case kAsioResetRequest: RequestReset(L"The ASIO driver asked to be restarted"); return 1;
         case kAsioBufferSizeChange: RequestReset(L"The ASIO driver changed its buffer size"); return 1;
-        case kAsioResyncRequest:
+        case kAsioResyncRequest: resyncs_.fetch_add(1, std::memory_order_relaxed); return 1;
         case kAsioLatenciesChanged: return 1;
         case kAsioOverload: overloads_.fetch_add(1, std::memory_order_relaxed); return 1;
         case kAsioSupportsTimeInfo:
