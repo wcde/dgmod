@@ -213,6 +213,7 @@ void BridgeEngine::Run(HANDLE stopEvent, HANDLE reloadEvent, BridgeStatusMapping
     ::QueryPerformanceFrequency(&f);
     qpcToUs_ = 1e6 / double(f.QuadPart);
     qpcToSec_ = 1.0 / double(f.QuadPart);
+    bitReportTicks_ = ::GetTickCount64() - 540'000;  // the first bit check summary a minute after the start
     ComScope com(COINIT_MULTITHREADED);
     Log(L"bridge started");
 
@@ -378,11 +379,14 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
                                                std::max<uint32_t>(bufferFrames_, 17) - 1);
             fadeInPos_ = fadeFrames_;
             holdPcm_.assign(size_t(fadeFrames_) * channels_, 0.0f);
-            // Silence with the edge rate of this stream (a kept stream may still idle on the one of the session before).
-            const uint32_t idle = dsd_.IdlePattern();
-            const uint64_t idle48 = (uint64_t{idle} << 24) | idle;
-            for (int i = 0; i < 3; ++i) idleWords_[i] = static_cast<uint16_t>(idle48 >> (32 - 16 * i));
-            asio_.SetIdlePattern(idle);
+            // The rules of this stream for the silence between streams and the bit check (a kept stream may still idle
+            // on the silence of the session before).
+            std::vector<uint16_t> idle(bufferFrames_);
+            dsd_.FillIdle(idle.data(), bufferFrames_, 1);
+            asio_.SetIdle(idle.data(), dsd_.MinRun(), dsd_.MaxRun());
+            Log(std::format(L"bitstream: every bit sent to the driver is checked for runs of {} to {} equal bits",
+                            dsd_.MinRun(), dsd_.MaxRun()));
+            dsdPhase_ = 0;
             asioEpoch_ = asio_.Epoch();
         }
     }
@@ -615,7 +619,8 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     base_.asioDsdMask = mask;
     if (!opened) return std::unexpected(opened.error());
     const AsioDsdOutput::Opened& o = *opened;
-    asioBase_ = {asio_.LateSwitches(), asio_.MissingEmergencies(), asio_.Resyncs(), asio_.Overloads(), asio_.Stalls()};
+    asioBase_ = {asio_.LateSwitches(), asio_.MissingEmergencies(), asio_.Resyncs(),
+                 asio_.Overloads(),    asio_.Stalls(),             asio_.Checked().violations};
     native_ = true;
     dop_ = false;
     deviceChannels_ = o.deviceChannels;
@@ -935,9 +940,10 @@ void BridgeEngine::RenderThread() {
                           [this] { dsd_.Process(modPcm_.data(), fadeFrames_, dsdWords_.data()); });
         jobs.spare.emplace(L"dgmod bridge dsd spare", [this] {
             dsdSpare_.Process(emergencyPcm_.data(), spareTail_, emergencyWords_.data());
-            for (uint32_t f = spareTail_; f < bufferFrames_; ++f)
-                for (uint32_t c = 0; c < channels_; ++c)
-                    emergencyWords_[size_t(f) * channels_ + c] = idleWords_[(f - spareTail_) % 3];
+            // The fade-out ends on a cell boundary (QueueNative); idle silence fills the rest and ends on one too.
+            for (uint32_t c = 0; c < channels_; ++c)
+                dsdSpare_.FillIdle(emergencyWords_.data() + size_t(spareTail_) * channels_ + c, bufferFrames_ - spareTail_,
+                                   channels_);
             asio_.SetEmergency(spareSeq_, emergencyWords_.data(), channels_);
         });
         headJob_ = &*jobs.head;
@@ -1108,7 +1114,8 @@ void BridgeEngine::LogGlitches() {
                              native_ ? asio_.MissingEmergencies() - asioBase_.missingEmergencies : 0,
                              native_ ? asio_.Resyncs() - asioBase_.resyncs : 0,
                              native_ ? asio_.Overloads() - asioBase_.overloads : 0,
-                             native_ ? asio_.Stalls() - asioBase_.stalls : 0};
+                             native_ ? asio_.Stalls() - asioBase_.stalls : 0,
+                             native_ ? asio_.Checked().violations - asioBase_.bitViolations : 0};
     auto delta = [](const wchar_t* name, uint64_t a, uint64_t b) {
         return a > b ? std::format(L" {} +{}", name, a - b) : std::wstring();
     };
@@ -1124,6 +1131,18 @@ void BridgeEngine::LogGlitches() {
                         delta(L"ASIO driver resyncs", now.asioResyncs, logged_.asioResyncs) +
                         delta(L"ASIO driver overloads", now.asioOverloads, logged_.asioOverloads) +
                         delta(L"ASIO driver stalls", now.asioStalls, logged_.asioStalls);
+    if (now.bitViolations > logged_.bitViolations) {
+        static constexpr const wchar_t* kSource[] = {L"a queued period", L"an emergency fade-out", L"idle silence"};
+        const AsioDsdOutput::BitCheck b = asio_.Checked();
+        what += std::format(L" bitstream rule violations +{} (last: a run of {} bits ending in {})",
+                            now.bitViolations - logged_.bitViolations, b.lastRun, kSource[std::min(b.lastSource, 2u)]);
+    }
+    if (const uint64_t t = ::GetTickCount64(); native_ && t - bitReportTicks_ >= 600'000) {
+        bitReportTicks_ = t;
+        const AsioDsdOutput::BitCheck b = asio_.Checked();
+        Log(std::format(L"bitstream: {} buffers checked since the driver was opened, {} rule violations", b.buffers,
+                        b.violations));
+    }
     if (what.empty()) return;
     logged_ = now;
     Log(std::format(L"glitch:{} (longest wake-up gap {:.1f} ms, period {:.1f} ms, fifo {:.1f} ms)", what,
@@ -1183,6 +1202,7 @@ void BridgeEngine::BeginNative() {
         // The driver ran dry: what it played last faded out to silence, so the stream restarts from silence.
         asioEpoch_ = epoch;
         dsd_.Reset();
+        dsdPhase_ = 0;
         fadeInPos_ = 0;
     }
     FillHead();
@@ -1195,8 +1215,13 @@ void BridgeEngine::QueueNative(const std::vector<float>& out) {
     // `out`, and the last L frames of `out`, faded out, are its emergency continuation (the real signal), so a dropout
     // never ends the stream abruptly. The held head was modulated meanwhile on the head thread (BeginNative).
     const uint32_t n = bufferFrames_, ch = channels_, hold = fadeFrames_;
-    // Emergency continuation: modulated fade-out, ~1/4 of the fade of modulated silence, then the DSD idle pattern.
-    const uint32_t tail = std::min(n, fadeFrames_ + fadeFrames_ / 4 + 16);
+    // Emergency continuation: modulated fade-out, ~1/4 of the fade of modulated silence, then idle silence
+    // (DsdEncoder::FillIdle). The fixed-edge stream is handed over on its cell grid: the modulated part ends on a cell
+    // boundary, so the idle cells join it without a broken cell.
+    const dsp::FixedEdgeShape* fe = dsd_.FixedEdgeShapeUsed();
+    const uint32_t cell = fe ? fe->cell : 0;
+    uint32_t endPhase = 0;  // cell phase at the end of this period
+    uint32_t tail = 0;
     headJob_->Wait();
     bool headDone = headPending_;
     headPending_ = false;
@@ -1206,8 +1231,18 @@ void BridgeEngine::QueueNative(const std::vector<float>& out) {
             // The driver ran dry meanwhile: the stream restarts from silence, the head is modulated again.
             asioEpoch_ = epoch;
             dsd_.Reset();
+            dsdPhase_ = 0;
             fadeInPos_ = 0;
             headDone = false;
+        }
+        endPhase = cell ? static_cast<uint32_t>((dsdPhase_ + uint64_t{n} * 16) % cell) : 0;
+        tail = std::min(n, fadeFrames_ + fadeFrames_ / 4 + 16);
+        if (cell) {
+            uint32_t t = tail;
+            while (t <= n && (endPhase + uint64_t{t} * 16) % cell) ++t;
+            if (t > n)
+                for (t = tail; t && (endPhase + uint64_t{t} * 16) % cell;) --t;
+            tail = t;
         }
         if (!headDone) {
             FillHead();
@@ -1240,6 +1275,7 @@ void BridgeEngine::QueueNative(const std::vector<float>& out) {
         // Refused only when the driver ran dry meanwhile: build the period again on the restarted stream.
         if (asio_.Epoch() == epoch) break;
     }
+    dsdPhase_ = endPhase;
     if (fadeInPos_ < fadeFrames_) fadeInPos_ = std::min(fadeFrames_, fadeInPos_ + n);
     std::copy(out.end() - ptrdiff_t(hold) * ch, out.end(), holdPcm_.begin());
 }

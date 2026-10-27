@@ -969,14 +969,47 @@ const FixedEdgeShape* DsdEncoder::FixedEdgeShapeUsed() const {
     return fixedEdge_.empty() ? nullptr : &fixedEdge_[0].Shape();
 }
 
-uint32_t DsdEncoder::IdlePattern() const {
+void DsdEncoder::FillIdle(uint16_t* words, uint32_t count, uint32_t stride) const {
     const FixedEdgeShape* fe = FixedEdgeShapeUsed();
-    if (!fe || fe->cell == 0 || 24 % fe->cell != 0) return 0x696969u;
-    const uint32_t ones = fe->cell / 2;
-    const uint32_t cellBits = ((1u << ones) - 1) << (fe->cell - ones);  // a run of ones, then of zeros
-    uint32_t p = 0;
-    for (uint32_t i = 0; i < 24; i += fe->cell) p = (p << fe->cell) | cellBits;
-    return p;
+    if (!fe) {
+        for (uint32_t i = 0; i < count; ++i) words[size_t(i) * stride] = 0x6969;
+        return;
+    }
+    const uint64_t bits = uint64_t{count} * 16;
+    uint64_t acc = 0;  // pending bits, oldest highest
+    uint32_t have = 0, w = 0;
+    auto put = [&](uint32_t n, uint32_t bit) {
+        for (uint32_t i = 0; i < n; ++i) {
+            acc = (acc << 1) | bit;
+            if (++have == 16) {
+                words[size_t(w++) * stride] = static_cast<uint16_t>(acc);
+                acc = 0;
+                have = 0;
+            }
+        }
+    };
+    const uint32_t cell = fe->cell;
+    const uint64_t cells = bits / cell;
+    const auto rest = static_cast<uint32_t>(bits % cell);
+    for (uint64_t k = 0; k < cells; ++k) {
+        const uint32_t len = k + 1 == cells ? cell + rest : cell;  // the last cell takes the rest
+        put(len / 2, 1);
+        put(len - len / 2, 0);
+    }
+    if (!cells && rest) {
+        put(rest / 2, 1);
+        put(rest - rest / 2, 0);
+    }
+}
+
+uint32_t DsdEncoder::MinRun() const {
+    const FixedEdgeShape* fe = FixedEdgeShapeUsed();
+    return fe ? fe->minRun : 1;
+}
+
+uint32_t DsdEncoder::MaxRun() const {
+    const FixedEdgeShape* fe = FixedEdgeShapeUsed();
+    return fe ? fe->cell - fe->minRun : 32;
 }
 
 bool DsdEncoder::FixedEdgeAvx512() const { return !fixedEdge_.empty() && fixedEdge_[0].UsesAvx512(); }

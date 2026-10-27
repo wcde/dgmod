@@ -77,10 +77,18 @@ public:
     // (Info() describes it) instead of re-opening the driver, so the DAC never loses its input.
     [[nodiscard]] bool Running(const Request& request) const;
     [[nodiscard]] const Opened& Info() const { return opened_; }
-    // DSD silence played when nothing is queued: 24 bits, the earliest in bit 23 (dsp::DsdEncoder::IdlePattern; 0x69
-    // until set). Any thread.
-    void SetIdlePattern(uint32_t pattern);
-    // Starts the stream (no-op if it runs); both buffer halves start with the idle pattern.
+    // The stream rules (any thread): `idle` is one buffer of DSD silence (Opened::frames words, MSB first,
+    // dsp::DsdEncoder::FillIdle) played when nothing is queued (0x69 until set); every bit the driver gets is checked
+    // for runs of minRun..maxRun equal bits (dsp::DsdEncoder::MinRun/MaxRun), across buffers, so every join is checked.
+    void SetIdle(const uint16_t* idle, uint32_t minRun, uint32_t maxRun);
+    struct BitCheck {
+        uint64_t buffers = 0;     // buffers checked
+        uint64_t violations = 0;  // runs outside the rules
+        uint32_t lastRun = 0;     // the last bad run, in bits
+        uint32_t lastSource = 0;  // where it ended: 0 a queued period, 1 an emergency continuation, 2 idle silence
+    };
+    [[nodiscard]] BitCheck Checked() const;
+    // Starts the stream (no-op if it runs); both buffer halves start with the idle silence.
     Result<void> Start();
     // Stops the stream and unloads the driver (safe to call at any time).
     void Close();
@@ -105,7 +113,8 @@ public:
     bool Push(const uint16_t* words, const uint16_t* emergency, uint32_t channels, uint64_t epoch, uint64_t* seq = nullptr);
     void SetEmergency(uint64_t seq, const uint16_t* emergency, uint32_t channels);
     // The producer stopped on purpose (the stream is kept running for the next one): the queue running dry until the
-    // next Push is not a missed buffer.
+    // next Push is not a missed buffer, and the epoch advances, so the next producer starts a new stream: it is played
+    // only after the emergency continuation of the last buffer queued before (which ends the old stream cleanly).
     void EndFeed();
 
     // Any thread.
@@ -133,6 +142,7 @@ private:
     long OnMessage(long selector, long value);
     void RequestReset(const std::wstring& reason);
     void FillSilence(long index);
+    void CheckBits(long index, uint32_t source);  // callback thread, outside the queue lock
     // Queue slot i: channels x bytesPerBuffer_ packed bytes, the period followed by its emergency continuation.
     [[nodiscard]] uint8_t* Slot(uint64_t i, bool emergency) {
         return slots_.data() + ((i % kSlots) * 2 + (emergency ? 1 : 0)) * size_t(bytesPerBuffer_) * opened_.channels;
@@ -151,8 +161,7 @@ private:
     Opened opened_{};
     std::vector<std::array<void*, 2>> buffers_;
     uint32_t bytesPerBuffer_ = 0;
-    uint32_t idle_ = 0x696969;  // SetIdlePattern
-    uint32_t idlePhase_ = 0;    // next byte of the 3-byte idle cycle
+    std::vector<uint8_t> idle_;  // one packed channel of idle silence (SetIdle), the same for every channel
 
     // The queue: slots head_ - 1 .. tail_ are pushed and waiting; slot tail_ - 1 was played last and keeps its
     // emergency continuation, so the producer never reuses it (one slot more than the depth plus that one).
@@ -163,6 +172,15 @@ private:
     uint64_t head_ = 0, tail_ = 0;
     bool emergencyReady_ = false;  // slot tail_ - 1 was played and its emergency continuation not yet
     bool fed_ = true;              // EndFeed() was not called since the last Push
+    uint64_t endSeq_ = ~uint64_t{0};  // EndFeed: slots from here on belong to a new stream
+
+    // Run-length check (callback thread; rules and reset requests from SetIdle).
+    std::atomic<uint32_t> minRun_{1}, maxRun_{32};
+    std::atomic<bool> checkReset_{true};
+    std::vector<uint32_t> run_;    // per channel: length of the run in progress (0 = unknown)
+    std::vector<uint8_t> runBit_;  // per channel: its bit value
+    std::atomic<uint64_t> checkedBuffers_{0}, violations_{0};
+    std::atomic<uint32_t> lastBadRun_{0}, lastBadSource_{0};
     std::array<uint64_t, kSlots> emergencySeq_{};  // per slot: the push whose continuation it holds (~0 = none)
     std::atomic<uint64_t> epoch_{0};
 

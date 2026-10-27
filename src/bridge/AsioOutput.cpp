@@ -374,10 +374,16 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
         {
             std::lock_guard lock(queueMutex_);
             slots_.assign(size_t(kSlots) * 2 * bytesPerBuffer_ * o.channels, uint8_t{0x69});
-            idle_ = 0x696969;
-            idlePhase_ = 0;
+            idle_.assign(bytesPerBuffer_, o.lsbFirst ? Reverse8(0x69) : uint8_t{0x69});
+            endSeq_ = ~uint64_t{0};
         }
-        opened_ = o;  // FillSilence needs the bit order
+        minRun_ = 1;
+        maxRun_ = 32;
+        checkReset_ = true;
+        checkedBuffers_ = violations_ = 0;
+        lastBadRun_ = lastBadSource_ = 0;
+        run_.assign(o.channels, 0);
+        runBit_.assign(o.channels, 0);
         FillSilence(0);
         FillSilence(1);
         long inLatency = 0, outLatency = 0;
@@ -529,6 +535,8 @@ bool AsioDsdOutput::Push(const uint16_t* words, const uint16_t* emergency, uint3
 void AsioDsdOutput::EndFeed() {
     std::lock_guard lock(queueMutex_);
     fed_ = false;
+    endSeq_ = head_;
+    epoch_.fetch_add(1, std::memory_order_release);
 }
 
 void AsioDsdOutput::SetEmergency(uint64_t seq, const uint16_t* emergency, uint32_t channels) {
@@ -547,23 +555,110 @@ void AsioDsdOutput::CopySlot(const uint8_t* src, long index) {
         std::memcpy(buffers_[c][index & 1], src + size_t(c) * bytesPerBuffer_, bytesPerBuffer_);
 }
 
-void AsioDsdOutput::SetIdlePattern(uint32_t pattern) {
+void AsioDsdOutput::SetIdle(const uint16_t* idle, uint32_t minRun, uint32_t maxRun) {
+    std::vector<uint8_t> packed(bytesPerBuffer_);
+    PackDsdChannel(idle, opened_.frames, 1, 0, opened_.lsbFirst, packed.data());
+    const bool minChanged = minRun_.exchange(minRun) != minRun;
+    const bool rules = (maxRun_.exchange(maxRun) != maxRun) || minChanged;
     std::lock_guard lock(queueMutex_);
-    idle_ = pattern & 0xFFFFFFu;
+    // Other rules or another silence: the stream changes its kind here, a join no rule covers (not checked).
+    if (rules || packed != idle_) checkReset_ = true;
+    idle_ = std::move(packed);
+}
+
+AsioDsdOutput::BitCheck AsioDsdOutput::Checked() const {
+    return {checkedBuffers_.load(std::memory_order_relaxed), violations_.load(std::memory_order_relaxed),
+            lastBadRun_.load(std::memory_order_relaxed), lastBadSource_.load(std::memory_order_relaxed)};
 }
 
 void AsioDsdOutput::FillSilence(long index) {
-    // The 3-byte cycle continues from the buffer filled before, so repeated silence keeps its cell grid.
-    uint8_t cycle[3];
-    for (int i = 0; i < 3; ++i) {
-        const auto b = static_cast<uint8_t>(idle_ >> (16 - 8 * i));
-        cycle[i] = opened_.lsbFirst ? Reverse8(b) : b;
+    for (auto& b : buffers_) std::memcpy(b[index & 1], idle_.data(), bytesPerBuffer_);
+}
+
+namespace {
+
+// Per byte, earliest bit first: length of the leading and trailing run, and the runs that touch neither end.
+struct RunTables {
+    uint8_t lead[256], trail[256], innerCount[256], inner[256][6], rev[256];
+    RunTables() {
+        for (int b = 0; b < 256; ++b) {
+            uint8_t runs[8]{};
+            int n = 0, len = 1;
+            for (int i = 6; i >= 0; --i) {
+                if (((b >> i) & 1) == ((b >> (i + 1)) & 1)) {
+                    ++len;
+                } else {
+                    runs[n++] = static_cast<uint8_t>(len);
+                    len = 1;
+                }
+            }
+            runs[n++] = static_cast<uint8_t>(len);
+            lead[b] = runs[0];
+            trail[b] = runs[n - 1];
+            innerCount[b] = static_cast<uint8_t>(n > 2 ? n - 2 : 0);
+            for (int i = 1; i + 1 < n; ++i) inner[b][i - 1] = runs[i];
+            rev[b] = Reverse8(static_cast<uint8_t>(b));
+        }
     }
-    for (auto& buf : buffers_) {
-        auto* dst = static_cast<uint8_t*>(buf[index & 1]);
-        for (uint32_t i = 0; i < bytesPerBuffer_; ++i) dst[i] = cycle[(idlePhase_ + i) % 3];
+};
+const RunTables g_runs;
+
+}  // namespace
+
+void AsioDsdOutput::CheckBits(long index, uint32_t source) {
+    if (checkReset_.exchange(false, std::memory_order_acquire)) std::fill(run_.begin(), run_.end(), 0u);
+    const uint32_t lo = minRun_.load(std::memory_order_relaxed), hi = maxRun_.load(std::memory_order_relaxed);
+    uint64_t bad = 0;
+    uint32_t badRun = 0;
+    auto check = [&](uint32_t r) {
+        if (r && (r < lo || r > hi)) {
+            ++bad;
+            badRun = r;
+        }
+    };
+    for (size_t c = 0; c < buffers_.size(); ++c) {
+        const auto* p = static_cast<const uint8_t*>(buffers_[c][index & 1]);
+        uint32_t run = run_[c];
+        uint32_t bit = run ? runBit_[c] : 2u;
+        bool partial = !run;  // the first run began before the check (re)started: its length is unknown
+        auto ended = [&](uint32_t r) {
+            if (!r) return;
+            if (partial) partial = false;
+            else check(r);
+        };
+        for (uint32_t i = 0; i < bytesPerBuffer_; ++i) {
+            const uint8_t b = opened_.lsbFirst ? g_runs.rev[p[i]] : p[i];
+            const uint32_t top = b >> 7;
+            if (g_runs.lead[b] == 8) {  // 0x00 or 0xFF
+                if (top == bit) {
+                    run += 8;
+                } else {
+                    ended(run);
+                    run = 8;
+                    bit = top;
+                }
+                continue;
+            }
+            if (top == bit) {
+                run += g_runs.lead[b];
+            } else {
+                ended(run);
+                run = g_runs.lead[b];
+            }
+            ended(run);  // the leading run ends inside this byte
+            for (uint32_t k = 0; k < g_runs.innerCount[b]; ++k) check(g_runs.inner[b][k]);
+            run = g_runs.trail[b];
+            bit = b & 1u;
+        }
+        run_[c] = run;
+        runBit_[c] = static_cast<uint8_t>(bit);
     }
-    idlePhase_ = (idlePhase_ + bytesPerBuffer_) % 3;
+    checkedBuffers_.fetch_add(1, std::memory_order_relaxed);
+    if (bad) {
+        violations_.fetch_add(bad, std::memory_order_relaxed);
+        lastBadRun_.store(badRun, std::memory_order_relaxed);
+        lastBadSource_.store(source, std::memory_order_relaxed);
+    }
 }
 
 double AsioDsdOutput::MeasuredSwitchSec() const {
@@ -594,9 +689,14 @@ void AsioDsdOutput::OnSwitch(long index) {
     lastSwitchQpc_.store(now, std::memory_order_relaxed);
     timedSwitches_.fetch_add(1, std::memory_order_relaxed);
     switchSeq_.fetch_add(1, std::memory_order_relaxed);
+    uint32_t source = 0;
     {
         std::lock_guard lock(queueMutex_);
-        if (tail_ < head_) {
+        // The producer before ended here (EndFeed): its stream ends with the emergency continuation of its last buffer
+        // before anything the next producer queued, which starts a stream of its own (the epoch advanced already).
+        const bool ended = tail_ == endSeq_ && emergencyReady_;
+        if (tail_ == endSeq_) endSeq_ = ~uint64_t{0};
+        if (!ended && tail_ < head_) {
             CopySlot(Slot(tail_, false), index);
             ++tail_;
             emergencyReady_ = true;
@@ -606,12 +706,14 @@ void AsioDsdOutput::OnSwitch(long index) {
             const bool attached = emergencyReady_ && emergencySeq_[(tail_ - 1) % kSlots] == tail_ - 1;
             if (attached) CopySlot(Slot(tail_ - 1, true), index);
             else FillSilence(index);
-            if (emergencyReady_ && fed_) late_.fetch_add(1, std::memory_order_relaxed);
-            if (emergencyReady_ && fed_ && !attached) missing_.fetch_add(1, std::memory_order_relaxed);
+            source = attached ? 1 : 2;
+            if (!ended && emergencyReady_ && fed_) late_.fetch_add(1, std::memory_order_relaxed);
+            if (!ended && emergencyReady_ && fed_ && !attached) missing_.fetch_add(1, std::memory_order_relaxed);
             emergencyReady_ = false;
-            epoch_.fetch_add(1, std::memory_order_release);
+            if (!ended) epoch_.fetch_add(1, std::memory_order_release);
         }
     }
+    CheckBits(index, source);
     ::SetEvent(switchEvent_.Get());
     if (opened_.outputReady) driver_->outputReady();
 }

@@ -188,11 +188,15 @@ public:
     // Cell shape of the fixed-edge code in use (nullptr: the delta-sigma loop), and whether it runs on AVX-512.
     [[nodiscard]] const FixedEdgeShape* FixedEdgeShapeUsed() const;
     [[nodiscard]] bool FixedEdgeAvx512() const;
-    // DSD silence that looks like this encoder's stream on silence: 24 bits, the earliest in bit 23. The fixed-edge
-    // code idles on cells half ones, half zeros (2 edges per cell); 0x69 has 6 edges per byte, 9 times more at 24-bit
-    // cells. A 1-bit DAC adds an error at every edge, so a jump of the edge rate is a step of its output: a click even
-    // in silence. Played wherever no modulated signal is available (between streams, after an emergency fade-out).
-    [[nodiscard]] uint32_t IdlePattern() const;
+    // DSD silence that obeys the rules of this encoder's stream, for wherever no modulated signal is available (between
+    // streams, after an emergency fade-out): `count` words, `stride` apart. Fixed-edge code: idle cells (half ones, then
+    // zeros) from a cell boundary, the last one stretched (by 8 or 16 bits) to end exactly with the words, so the
+    // silence joins a stream that ends on a cell boundary and one that starts on it. Delta-sigma: 0x69.
+    void FillIdle(uint16_t* words, uint32_t count, uint32_t stride) const;
+    // Shortest and longest run of equal bits the stream (and FillIdle) may contain. Fixed-edge: minRun and cell - minRun
+    // (a cell ends with zeros, the next starts with ones, so runs never merge); delta-sigma: 1 and a generous bound.
+    [[nodiscard]] uint32_t MinRun() const;
+    [[nodiscard]] uint32_t MaxRun() const;
     [[nodiscard]] bool LookAheadAvx512() const { return shape_.paths && modulators_[0].UsesAvx512(); }
     void AllowAvx512(bool allow);  // for tests
     void SetClipLevel(double clip) {  // for tests
