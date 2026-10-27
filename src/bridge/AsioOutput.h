@@ -88,6 +88,11 @@ public:
         uint32_t lastSource = 0;  // where it ended: 0 a queued period, 1 an emergency continuation, 2 idle silence
     };
     [[nodiscard]] BitCheck Checked() const;
+    // Copies of the buffers handed to the driver, for a reader on another thread (the in-band monitor). `next`: the
+    // switch to read (advanced; skips ahead if the reader fell kTapSlots behind). Fills `bytes` (channels x
+    // bytesPerBuffer, as handed to the driver) and the source (BitCheck::lastSource codes). False: nothing new.
+    // `skipped`: buffers were lost before this one (the reader must not decode across the gap).
+    bool ReadTap(uint64_t& next, std::vector<uint8_t>& bytes, uint32_t& source, bool& skipped) const;
     // Starts the stream (no-op if it runs); both buffer halves start with the idle silence.
     Result<void> Start();
     // Stops the stream and unloads the driver (safe to call at any time).
@@ -177,10 +182,18 @@ private:
     // Run-length check (callback thread; rules and reset requests from SetIdle).
     std::atomic<uint32_t> minRun_{1}, maxRun_{32};
     std::atomic<bool> checkReset_{true};
+    bool rulesPending_ = false;  // queue lock: SetIdle rules wait for the first buffer of the new stream (pendingSeq_)
+    uint32_t pendingMin_ = 1, pendingMax_ = 32;
+    uint64_t pendingSeq_ = 0;
     std::vector<uint32_t> run_;    // per channel: length of the run in progress (0 = unknown)
     std::vector<uint8_t> runBit_;  // per channel: its bit value
     std::atomic<uint64_t> checkedBuffers_{0}, violations_{0};
     std::atomic<uint32_t> lastBadRun_{0}, lastBadSource_{0};
+    // Tap (callback writes, ReadTap reads): the last kTapSlots buffers handed to the driver.
+    static constexpr uint32_t kTapSlots = 64;  // 0.7 s at 11.6 ms buffers
+    std::vector<uint8_t> tap_;
+    std::array<uint32_t, kTapSlots> tapSource_{};
+    std::atomic<uint64_t> tapHead_{0};  // buffers written
     std::array<uint64_t, kSlots> emergencySeq_{};  // per slot: the push whose continuation it holds (~0 = none)
     std::atomic<uint64_t> epoch_{0};
 

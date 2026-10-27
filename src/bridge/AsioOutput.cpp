@@ -376,6 +376,7 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
             slots_.assign(size_t(kSlots) * 2 * bytesPerBuffer_ * o.channels, uint8_t{0x69});
             idle_.assign(bytesPerBuffer_, o.lsbFirst ? Reverse8(0x69) : uint8_t{0x69});
             endSeq_ = ~uint64_t{0};
+            rulesPending_ = false;
         }
         minRun_ = 1;
         maxRun_ = 32;
@@ -384,6 +385,8 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
         lastBadRun_ = lastBadSource_ = 0;
         run_.assign(o.channels, 0);
         runBit_.assign(o.channels, 0);
+        tap_.assign(size_t(kTapSlots) * bytesPerBuffer_ * o.channels, 0);
+        tapHead_ = 0;
         FillSilence(0);
         FillSilence(1);
         long inLatency = 0, outLatency = 0;
@@ -558,17 +561,38 @@ void AsioDsdOutput::CopySlot(const uint8_t* src, long index) {
 void AsioDsdOutput::SetIdle(const uint16_t* idle, uint32_t minRun, uint32_t maxRun) {
     std::vector<uint8_t> packed(bytesPerBuffer_);
     PackDsdChannel(idle, opened_.frames, 1, 0, opened_.lsbFirst, packed.data());
-    const bool minChanged = minRun_.exchange(minRun) != minRun;
-    const bool rules = (maxRun_.exchange(maxRun) != maxRun) || minChanged;
     std::lock_guard lock(queueMutex_);
-    // Other rules or another silence: the stream changes its kind here, a join no rule covers (not checked).
-    if (rules || packed != idle_) checkReset_ = true;
+    // Other rules or another silence: the stream changes its kind with the next buffer pushed. Until that one plays,
+    // what plays belongs to the stream before (or is silence of the new kind): not checked; its join with the new
+    // stream is one no rule covers either.
+    if (minRun != minRun_.load() || maxRun != maxRun_.load() || packed != idle_) {
+        pendingMin_ = minRun;
+        pendingMax_ = maxRun;
+        pendingSeq_ = head_;
+        rulesPending_ = true;
+    }
     idle_ = std::move(packed);
 }
 
 AsioDsdOutput::BitCheck AsioDsdOutput::Checked() const {
     return {checkedBuffers_.load(std::memory_order_relaxed), violations_.load(std::memory_order_relaxed),
             lastBadRun_.load(std::memory_order_relaxed), lastBadSource_.load(std::memory_order_relaxed)};
+}
+
+bool AsioDsdOutput::ReadTap(uint64_t& next, std::vector<uint8_t>& bytes, uint32_t& source, bool& skipped) const {
+    const uint64_t h = tapHead_.load(std::memory_order_acquire);
+    skipped = false;
+    if (next >= h) return false;
+    if (h - next > kTapSlots - 8) {  // fell behind: keep a margin from the writer
+        next = h - (kTapSlots - 8);
+        skipped = true;
+    }
+    const size_t slotBytes = size_t(bytesPerBuffer_) * buffers_.size();
+    const uint8_t* src = tap_.data() + (next % kTapSlots) * slotBytes;
+    bytes.assign(src, src + slotBytes);
+    source = tapSource_[next % kTapSlots];
+    ++next;
+    return true;
 }
 
 void AsioDsdOutput::FillSilence(long index) {
@@ -690,12 +714,23 @@ void AsioDsdOutput::OnSwitch(long index) {
     timedSwitches_.fetch_add(1, std::memory_order_relaxed);
     switchSeq_.fetch_add(1, std::memory_order_relaxed);
     uint32_t source = 0;
+    bool skipCheck = false;
     {
         std::lock_guard lock(queueMutex_);
         // The producer before ended here (EndFeed): its stream ends with the emergency continuation of its last buffer
         // before anything the next producer queued, which starts a stream of its own (the epoch advanced already).
         const bool ended = tail_ == endSeq_ && emergencyReady_;
         if (tail_ == endSeq_) endSeq_ = ~uint64_t{0};
+        if (rulesPending_) {
+            if (!ended && tail_ < head_ && tail_ >= pendingSeq_) {  // the first buffer of the new stream
+                minRun_ = pendingMin_;
+                maxRun_ = pendingMax_;
+                rulesPending_ = false;
+                checkReset_ = true;
+            } else {
+                skipCheck = true;
+            }
+        }
         if (!ended && tail_ < head_) {
             CopySlot(Slot(tail_, false), index);
             ++tail_;
@@ -713,7 +748,16 @@ void AsioDsdOutput::OnSwitch(long index) {
             if (!ended) epoch_.fetch_add(1, std::memory_order_release);
         }
     }
-    CheckBits(index, source);
+    if (skipCheck) checkReset_ = true;
+    else CheckBits(index, source);
+    {
+        const uint64_t h = tapHead_.load(std::memory_order_relaxed);
+        const size_t slotBytes = size_t(bytesPerBuffer_) * buffers_.size();
+        uint8_t* dst = tap_.data() + (h % kTapSlots) * slotBytes;
+        for (size_t c = 0; c < buffers_.size(); ++c) std::memcpy(dst + c * bytesPerBuffer_, buffers_[c][index & 1], bytesPerBuffer_);
+        tapSource_[h % kTapSlots] = source;
+        tapHead_.store(h + 1, std::memory_order_release);
+    }
     ::SetEvent(switchEvent_.Get());
     if (opened_.outputReady) driver_->outputReady();
 }

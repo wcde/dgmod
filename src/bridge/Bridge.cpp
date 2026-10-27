@@ -382,13 +382,6 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
                                                std::max<uint32_t>(bufferFrames_, 17) - 1);
             fadeInPos_ = fadeFrames_;
             holdPcm_.assign(size_t(fadeFrames_) * channels_, 0.0f);
-            // The rules of this stream for the silence between streams and the bit check (a kept stream may still idle
-            // on the silence of the session before).
-            std::vector<uint16_t> idle(bufferFrames_);
-            dsd_.FillIdle(idle.data(), bufferFrames_, 1);
-            asio_.SetIdle(idle.data(), dsd_.MinRun(), dsd_.MaxRun());
-            Log(std::format(L"bitstream: every bit sent to the driver is checked for runs of {} to {} equal bits",
-                            dsd_.MinRun(), dsd_.MaxRun()));
             dsdPhase_ = 0;
             asioEpoch_ = asio_.Epoch();
             dsdCarry_.SetThreadWrapper(proAudio);
@@ -484,13 +477,20 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
         } else {
             asioEpoch_ = asio_.Epoch();
         }
+        // The rules of this stream for the silence between streams and the bit check, from its first buffer on.
+        std::vector<uint16_t> idle(bufferFrames_);
+        dsd_.FillIdle(idle.data(), bufferFrames_, 1);
+        asio_.SetIdle(idle.data(), dsd_.MinRun(), dsd_.MaxRun());
     }
     carryOnStop_ = false;
     std::thread capture([this] { CaptureThread(); });
     std::thread render([this] { RenderThread(); });
     if (native_) {
         dsdCarry_.Configure(channels_, outRate_, inRate_ * 0.5, bufferFrames_, dsdKey_.lookAhead, dsdKey_.modulator);
-        if (continued) Log(L"dsd: the modulator continues the stream of the session before (no restart)");
+        Log(std::format(L"dsd: {}; every bit sent to the driver is checked for runs of {} to {} equal bits and decoded",
+                        continued ? L"the modulator continues the stream of the session before (no restart)"
+                                  : L"a new modulator stream starts",
+                        dsd_.MinRun(), dsd_.MaxRun()));
     }
 
     SessionEnd end = SessionEnd::Stop;
@@ -529,7 +529,10 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
             end = SessionEnd::Retry;
             break;
         }
-        if (native_) CheckAsioTiming();
+        if (native_) {
+            CheckAsioTiming();
+            MonitorTap();
+        }
         PublishStatus();
         LogGlitches();
     }
@@ -655,6 +658,10 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     base_.asioDsdMask = mask;
     if (!opened) return std::unexpected(opened.error());
     const AsioDsdOutput::Opened& o = *opened;
+    if (!kept) {
+        monitor_.Reset(o.channels, o.bufferSamples / 8, o.dsdRate, o.lsbFirst);
+        tapNext_ = 0;
+    }
     asioBase_ = {asio_.LateSwitches(), asio_.MissingEmergencies(), asio_.Resyncs(),
                  asio_.Overloads(),    asio_.Stalls(),             asio_.Checked().violations};
     native_ = true;
@@ -1178,8 +1185,12 @@ void BridgeEngine::LogGlitches() {
     if (const uint64_t t = ::GetTickCount64(); native_ && t - bitReportTicks_ >= 600'000) {
         bitReportTicks_ = t;
         const AsioDsdOutput::BitCheck b = asio_.Checked();
-        Log(std::format(L"bitstream: {} buffers checked since the driver was opened, {} rule violations", b.buffers,
-                        b.violations));
+        double quietest = 0, loudest = 0;
+        const bool decoded = monitor_.TakeRange(quietest, loudest);
+        Log(std::format(L"bitstream: {} buffers checked since the driver was opened, {} rule violations{}", b.buffers,
+                        b.violations,
+                        decoded ? std::format(L"; decoded in-band peak per buffer {:.1f} .. {:.1f} dBFS", quietest, loudest)
+                                : std::wstring()));
     }
     if (what.empty()) return;
     logged_ = now;
@@ -1231,6 +1242,25 @@ void BridgeEngine::FillHead() {
     for (uint32_t i = 0; i < fadeFrames_; ++i) {
         const float g = fading ? FadeIn(uint64_t(fadeInPos_) + i) : 1.0f;
         for (uint32_t c = 0; c < ch; ++c) modPcm_[size_t(i) * ch + c] = holdPcm_[size_t(i) * ch + c] * g;
+    }
+}
+
+void BridgeEngine::MonitorTap() {
+    static constexpr const wchar_t* kSource[] = {L"queued period", L"emergency fade-out", L"idle silence"};
+    uint32_t source = 0;
+    bool skipped = false;
+    while (asio_.ReadTap(tapNext_, tapBytes_, source, skipped)) {
+        if (skipped) monitor_.Gap();
+        InbandMonitor::Event e;
+        if (monitor_.Process(tapBytes_.data(), e)) {
+            float in = 0;
+            for (float v : recentIn_) in = std::max(in, v);
+            Log(std::format(L"inband: a pulse of {:.1f} dBFS (DSD full scale) out of silence (below {:.1f} dBFS) in the "
+                            L"bit stream itself, channel {}, {:.2f} ms into a {} buffer (switch {}); input peak in the "
+                            L"last 2 s {:.1f} dBFS",
+                            e.peakDb, e.beforeDb, e.channel + 1, e.offsetMs, kSource[std::min(source, 2u)], tapNext_ - 1,
+                            20.0 * std::log10(in + 1e-30)));
+        }
     }
 }
 
@@ -1451,6 +1481,8 @@ void BridgeEngine::PublishStatus() {
         d.peakIn[c] = peakIn_[c].exchange(0.f);
         d.peakOut[c] = peakOut_[c].exchange(0.f);
     }
+    recentIn_[recentPos_ % recentIn_.size()] = std::max(d.peakIn[0], d.peakIn[1]);
+    ++recentPos_;
     CopyText(d.message, message_);
     d.heartbeat = FileTimeNow();
     status_->Publish(d);

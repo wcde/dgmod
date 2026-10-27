@@ -8,6 +8,7 @@
 #include "bridge/Declicker.h"
 #include "bridge/DriftController.h"
 #include "bridge/FrameFifo.h"
+#include "bridge/InbandMonitor.h"
 #include "bridge/LevelGuard.h"
 #include "bridge/SampleWriter.h"
 #include "bridge/SlipCopier.h"
@@ -198,6 +199,13 @@ private:
         uint64_t lateSwitches = 0, missingEmergencies = 0, resyncs = 0, overloads = 0, stalls = 0, bitViolations = 0;
     } asioBase_;
     uint64_t bitReportTicks_ = 0;  // main thread: GetTickCount64 of the last bit check summary
+    // Main thread: decodes what the driver got (native DSD) and logs pulses out of silence.
+    InbandMonitor monitor_;
+    uint64_t tapNext_ = 0;
+    std::vector<uint8_t> tapBytes_;
+    std::array<float, 20> recentIn_{};  // input peaks of the last status publications (about 2 s)
+    uint32_t recentPos_ = 0;
+    void MonitorTap();
     uint64_t sessionMaxWakeGap_ = 0;
     void LogGlitches();
     std::atomic<float> limiterMinGain_{1.0f};
