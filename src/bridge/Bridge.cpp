@@ -242,6 +242,7 @@ void BridgeEngine::Run(HANDLE stopEvent, HANDLE reloadEvent, BridgeStatusMapping
             asioTimingError_.clear();  // another driver, rate or buffer: native DSD may be tried again
         cfg = std::move(next);
     }
+    StopCarry(nullptr);
     asio_.Close();
 
     // Give the default playback device back.
@@ -278,6 +279,7 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     PublishStatus();
 
     auto wait = [&](const std::wstring& why) {
+        StopCarry(nullptr);
         asio_.Close();  // a stream kept from the session before: the DAC is free while waiting
         SetState(BridgeState::Waiting, why);
         PublishStatus();
@@ -364,6 +366,7 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
         };
         dsd_.SetThreadWrapper(proAudio);
         dsd_.Configure(channels_, outRate_, inRate_ * 0.5, bufferFrames_, cfg.dsdLookAhead, cfg.dsdModulator);
+        dsdKey_ = {channels_, outRate_, bufferFrames_, inRate_ * 0.5, cfg.dsdLookAhead, cfg.dsdModulator};
         dsdWords_.assign(size_t(bufferFrames_) * channels_, 0);
         // The fixed-edge code is stable up to about 0.65 of full scale: always the SACD reference level.
         dsdScale_ = dsd_.FixedEdgeUsed()   ? static_cast<float>(dsp::FixedEdgeModulator::kLevel)
@@ -388,6 +391,7 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
                             dsd_.MinRun(), dsd_.MaxRun()));
             dsdPhase_ = 0;
             asioEpoch_ = asio_.Epoch();
+            dsdCarry_.SetThreadWrapper(proAudio);
         }
     }
     base_.inRate = inRate_;
@@ -469,8 +473,25 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     drainedEvent_.Reset(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
     failEvent_.Reset(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
     SetState(BridgeState::Buffering, L"Waiting for audio on the source device");
+    // Native DSD: continue the stream the session before left running (same modulator), as late as possible.
+    bool continued = false;
+    if (native_) {
+        continued = StopCarry(&dsdKey_);
+        if (continued) {
+            dsd_.CopyStateFrom(dsdCarry_);
+            dsdPhase_ = carryPhase_;
+            asioEpoch_ = carryEpoch_;
+        } else {
+            asioEpoch_ = asio_.Epoch();
+        }
+    }
+    carryOnStop_ = false;
     std::thread capture([this] { CaptureThread(); });
     std::thread render([this] { RenderThread(); });
+    if (native_) {
+        dsdCarry_.Configure(channels_, outRate_, inRate_ * 0.5, bufferFrames_, dsdKey_.lookAhead, dsdKey_.modulator);
+        if (continued) Log(L"dsd: the modulator continues the stream of the session before (no restart)");
+    }
 
     SessionEnd end = SessionEnd::Stop;
     BridgeConfig live = cfg;  // cfg plus the tone settings applied since
@@ -512,9 +533,13 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
         PublishStatus();
         LogGlitches();
     }
+    // Applying new settings: the native DSD stream keeps running for the next session to take over (closed there if it
+    // needs other driver settings), unless the driver itself asked to be re-opened.
+    const bool carry = native_ && end == SessionEnd::Reload && !asio_.ResetRequested();
     if (end != SessionEnd::Retry) {
         // Fade out instead of cutting the DAC off mid-signal: the render thread plays the faded tail, lets the filter
-        // empty and hands one silent period to the device before the stream is stopped.
+        // empty and hands one silent period to the device before the stream is stopped (or carried on).
+        carryOnStop_ = carry;
         stopping_ = true;
         HANDLE drain[] = {drainedEvent_.Get(), failEvent_.Get()};
         ::WaitForMultipleObjects(2, drain, FALSE, 500);
@@ -522,10 +547,20 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     ::SetEvent(quitEvent_.Get());
     capture.join();
     render.join();
-    // Applying new settings: the native DSD stream keeps running on DSD silence for the next session to take over
-    // (closed there if it needs other driver settings), unless the driver itself asked to be re-opened.
-    if (end != SessionEnd::Reload || asio_.ResetRequested()) asio_.Close();
-    else if (native_) asio_.EndFeed();
+    if (carry && !failed_) {
+        // The modulator keeps running on silence from where the render thread left it (the queue still holds its
+        // silent periods), until the next session continues or ends its stream.
+        dsdCarry_.CopyStateFrom(dsd_);
+        carryKey_ = dsdKey_;
+        carryPhase_ = dsdPhase_;
+        carryEpoch_ = asioEpoch_;
+        carryStop_ = false;
+        carry_ = std::thread([this] { CarryLoop(); });
+    } else if (carry) {
+        asio_.EndFeed();
+    } else {
+        asio_.Close();
+    }
     if (renderClient_) renderClient_->Stop();
     if (captureClient_) captureClient_->Stop();
     render_.Reset();
@@ -615,6 +650,7 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     // is taken over, so the DAC does not drop and re-lock its input (an audible click) on every settings change.
     const bool kept = asio_.Running(req);
     uint32_t mask = kept ? asio_.Info().supportedMask : 0;
+    if (!kept) StopCarry(nullptr);
     auto opened = kept ? Result<AsioDsdOutput::Opened>(asio_.Info()) : asio_.Open(req, mask);
     base_.asioDsdMask = mask;
     if (!opened) return std::unexpected(opened.error());
@@ -668,6 +704,7 @@ Result<void> BridgeEngine::OpenRender(const BridgeConfig& cfg) {
     native_ = false;
     dop_ = false;
     if (cfg.NativeDsd() && !cfg.bypass) return OpenAsio(cfg);
+    StopCarry(nullptr);
     asio_.Close();  // a stream kept from a native DSD session holds the DAC
     ComPtr<IMMDevice> dev;
     if (FAILED(enumerator_->GetDevice(cfg.outputId.c_str(), &dev))) return dgmod::Fail(E_FAIL, L"Output device not found");
@@ -920,7 +957,8 @@ void BridgeEngine::RenderThread() {
     // Stopping: once the tail has played, one silent period queued behind it lets the device run it out (native DSD:
     // and the driver has taken every queued buffer).
     auto checkDrained = [&] {
-        if (stopping_.load(std::memory_order_acquire) && drainedPeriods >= 2 && (!native_ || asio_.Queued() == 0))
+        if (stopping_.load(std::memory_order_acquire) && drainedPeriods >= 2 &&
+            (!native_ || carryOnStop_.load(std::memory_order_acquire) || asio_.Queued() == 0))
             ::SetEvent(drainedEvent_.Get());
     };
     bool again = native_;  // native DSD: render the next period without waiting (the queue has room)
@@ -1194,6 +1232,53 @@ void BridgeEngine::FillHead() {
         const float g = fading ? FadeIn(uint64_t(fadeInPos_) + i) : 1.0f;
         for (uint32_t c = 0; c < ch; ++c) modPcm_[size_t(i) * ch + c] = holdPcm_[size_t(i) * ch + c] * g;
     }
+}
+
+void BridgeEngine::CarryLoop() {
+    ::SetThreadDescription(::GetCurrentThread(), L"dgmod bridge dsd carry");
+    MmcssScope mmcss;
+    const uint32_t frames = carryKey_.maxFrames, ch = carryKey_.channels;
+    const dsp::FixedEdgeShape* fe = dsdCarry_.FixedEdgeShapeUsed();
+    const uint32_t cell = fe ? fe->cell : 0;
+    const std::vector<float> silence(size_t(frames) * ch, 0.0f);
+    std::vector<uint16_t> words(silence.size());
+    while (!carryStop_.load(std::memory_order_acquire)) {
+        while (asio_.Space() > 0 && !carryStop_.load(std::memory_order_acquire)) {
+            if (const uint64_t epoch = asio_.Epoch(); epoch != carryEpoch_) {
+                // The driver ran dry meanwhile: the stream restarts from silence.
+                dsdCarry_.Reset();
+                carryPhase_ = 0;
+                carryEpoch_ = epoch;
+            }
+            dsdCarry_.Process(silence.data(), frames, words.data());
+            if (!asio_.Push(words.data(), nullptr, ch, carryEpoch_)) break;  // dry meanwhile: restarted above
+            if (cell) carryPhase_ = static_cast<uint32_t>((carryPhase_ + uint64_t{frames} * 16) % cell);
+        }
+        ::WaitForSingleObject(asio_.SwitchEvent(), 50);
+    }
+}
+
+bool BridgeEngine::StopCarry(const EncoderKey* next) {
+    if (!carry_.joinable()) return false;
+    carryStop_ = true;
+    carry_.join();
+    if (!next) return false;  // the driver is closed next
+    if (*next == carryKey_) return true;
+    // Another modulator: end the carried stream as an emergency fade-out ends, on the cell grid into idle cells.
+    if (asio_.Epoch() == carryEpoch_) {
+        const uint32_t frames = carryKey_.maxFrames, ch = carryKey_.channels;
+        const dsp::FixedEdgeShape* fe = dsdCarry_.FixedEdgeShapeUsed();
+        uint32_t t = 0;
+        while (fe && (carryPhase_ + uint64_t{t} * 16) % fe->cell) ++t;
+        const std::vector<float> silence(size_t(frames) * ch, 0.0f);
+        std::vector<uint16_t> words(silence.size());
+        if (t) dsdCarry_.Process(silence.data(), t, words.data());
+        for (uint32_t c = 0; c < ch; ++c) dsdCarry_.FillIdle(words.data() + size_t(t) * ch + c, frames - t, ch);
+        for (int i = 0; i < 10 && asio_.Space() == 0; ++i) ::WaitForSingleObject(asio_.SwitchEvent(), 20);
+        asio_.Push(words.data(), nullptr, ch, carryEpoch_);
+    }
+    asio_.EndFeed();
+    return false;
 }
 
 void BridgeEngine::BeginNative() {

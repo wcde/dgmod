@@ -124,6 +124,29 @@ private:
     std::vector<float> holdPcm_, modPcm_, emergencyPcm_;
     std::vector<uint16_t> emergencyWords_;
     uint32_t dsdPhase_ = 0;  // bits dsd_ produced since its reset, modulo its fixed-edge cell (0 = on the cell grid)
+    // Native DSD between sessions (applying settings): the modulator of the session before keeps running on silence on
+    // the carry thread, and a session with the same modulator continues that stream. Every start and end of a
+    // fixed-edge stream leaves an in-band pulse (-50 to -80 dBFS: a click), so the stream must not stop on a change of
+    // filter, buffer or tone settings.
+    struct EncoderKey {
+        uint32_t channels = 0, rate = 0, maxFrames = 0;
+        double band = 0;
+        dsp::LookAhead lookAhead{};
+        dsp::DsdModulator modulator{};
+        bool operator==(const EncoderKey&) const = default;
+    };
+    EncoderKey dsdKey_{}, carryKey_{};
+    dsp::DsdEncoder dsdCarry_;  // configured as dsd_; continues its state on the carry thread
+    std::thread carry_;
+    std::atomic<bool> carryStop_{false};
+    std::atomic<bool> carryOnStop_{false};  // render thread: the session ends into the carry thread (drain lighter)
+    uint64_t carryEpoch_ = 0;
+    uint32_t carryPhase_ = 0;
+    void CarryLoop();
+    // Stops the carry thread. With the key of the next session's encoder: returns true if that session continues the
+    // carried stream (state in dsdCarry_); otherwise the stream is ended on the cell grid into DSD silence (EndFeed).
+    // nullptr: the driver is about to be closed.
+    bool StopCarry(const EncoderKey* next);
     // Worker threads of the render thread (alive while it runs): the head of each period, and the emergency fade-out
     // of the period queued last (spareSeq_, spareTail_ frames).
     DsdJobThread* headJob_ = nullptr;

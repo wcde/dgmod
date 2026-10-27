@@ -113,6 +113,7 @@ private:
     uint64_t out_ = 0;   // committed bits not yet written, oldest first, in the low `pending_` bits
     uint32_t pending_ = 0;
     double limit_ = 0;   // |loop filter output| beyond this means the loop ran away
+    double idleState_[kStates]{};  // loop state on a steady run of idle cells (every reset starts from it)
     double peakV_ = 0;
     uint64_t resets_ = 0;
     bool allowAvx2_ = true, allowAvx512_ = true;

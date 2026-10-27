@@ -139,6 +139,37 @@ void FixedEdgeModulator::Configure(const NtfDesign& ntf, const FixedEdgeShape& s
     }
     // The loop filter output stays within about +-2.1 at the highest levels encoded (0.65 of full scale, DC).
     limit_ = 32.0;
+    // Loop state on a steady run of idle cells on silence: a stream starts from it after idle cells (DSD silence), as
+    // if the loop had produced them. From a zero state the loop instead cancels idle cells it never saw: an in-band
+    // pulse of about -49 dBFS (a click at every start), -82 dBFS from this state. The loop's resonators (the NTF zeros)
+    // do not decay, so the periodic solution of s = B s + C_idle is solved for rather than iterated to.
+    {
+        const uint32_t idle = cell / 2 - shape.minRun;
+        double a[kStates][kStates + 1];
+        for (uint32_t i = 0; i < kStates; ++i) {
+            for (uint32_t j = 0; j < kStates; ++j) a[i][j] = (i == j ? 1.0 : 0.0) - m_.b[j][i];
+            a[i][kStates] = m_.c[idle][i];
+        }
+        bool ok = true;
+        for (uint32_t k = 0; k < kStates && ok; ++k) {
+            uint32_t pivot = k;
+            for (uint32_t i = k + 1; i < kStates; ++i)
+                if (std::abs(a[i][k]) > std::abs(a[pivot][k])) pivot = i;
+            if (std::abs(a[pivot][k]) < 1e-12) {
+                ok = false;
+                break;
+            }
+            std::swap(a[k], a[pivot]);
+            for (uint32_t i = 0; i < kStates; ++i) {
+                if (i == k) continue;
+                const double f = a[i][k] / a[k][k];
+                for (uint32_t j = k; j <= kStates; ++j) a[i][j] -= f * a[k][j];
+            }
+        }
+        for (uint32_t i = 0; i < kStates; ++i) idleState_[i] = ok ? a[i][kStates] / a[i][i] : 0.0;
+        for (double v : idleState_)
+            if (!std::isfinite(v) || std::abs(v) > limit_) std::fill(std::begin(idleState_), std::end(idleState_), 0.0);
+    }
     Reset();
     resets_ = 0;
 }
@@ -174,6 +205,7 @@ void FixedEdgeModulator::CopyStateFrom(const FixedEdgeModulator& other) {
 void FixedEdgeModulator::ResetPaths(uint64_t history) {
     Paths& t = paths_[cur_];
     t = {};
+    std::copy(std::begin(idleState_), std::end(idleState_), t.s[0]);
     for (uint32_t p = 0; p < kPaths; ++p) {
         t.cost[p] = p == 0 ? 0.0 : kDead;
         t.history[p] = history;
