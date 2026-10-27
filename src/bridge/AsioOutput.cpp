@@ -242,7 +242,7 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
     qpcFreq_ = double(f.QuadPart);
     switchEvent_.Reset(::CreateEventW(nullptr, FALSE, FALSE, nullptr));
     resetEvent_.Reset(::CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    switchSeq_ = late_ = missing_ = overloads_ = resyncs_ = timedSwitches_ = 0;
+    switchSeq_ = late_ = missing_ = overloads_ = resyncs_ = stalls_ = timedSwitches_ = 0;
     request_ = req;
     firstSwitchQpc_ = lastSwitchQpc_ = 0;
     {
@@ -371,11 +371,13 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
             buffers_[c] = {infos[c].buffers[0], infos[c].buffers[1]};
         }
         bytesPerBuffer_ = o.bufferSamples / 8;
-        silence_ = o.lsbFirst ? Reverse8(0x69) : uint8_t{0x69};
         {
             std::lock_guard lock(queueMutex_);
-            slots_.assign(size_t(kSlots) * 2 * bytesPerBuffer_ * o.channels, silence_);
+            slots_.assign(size_t(kSlots) * 2 * bytesPerBuffer_ * o.channels, uint8_t{0x69});
+            idle_ = 0x696969;
+            idlePhase_ = 0;
         }
+        opened_ = o;  // FillSilence needs the bit order
         FillSilence(0);
         FillSilence(1);
         long inLatency = 0, outLatency = 0;
@@ -400,6 +402,11 @@ bool AsioDsdOutput::ResetRequested() const {
 Result<void> AsioDsdOutput::Start() {
     if (!sta_ || !driver_ || !buffersCreated_) return dgmod::Fail(E_UNEXPECTED, L"ASIO: not open");
     if (started_) return {};
+    {
+        std::lock_guard lock(queueMutex_);
+        FillSilence(0);
+        FillSilence(1);
+    }
     ASIOError e = ASE_OK;
     sta_->Run([&] {
         e = driver_->start();
@@ -540,8 +547,23 @@ void AsioDsdOutput::CopySlot(const uint8_t* src, long index) {
         std::memcpy(buffers_[c][index & 1], src + size_t(c) * bytesPerBuffer_, bytesPerBuffer_);
 }
 
+void AsioDsdOutput::SetIdlePattern(uint32_t pattern) {
+    std::lock_guard lock(queueMutex_);
+    idle_ = pattern & 0xFFFFFFu;
+}
+
 void AsioDsdOutput::FillSilence(long index) {
-    for (auto& b : buffers_) std::memset(b[index & 1], silence_, bytesPerBuffer_);
+    // The 3-byte cycle continues from the buffer filled before, so repeated silence keeps its cell grid.
+    uint8_t cycle[3];
+    for (int i = 0; i < 3; ++i) {
+        const auto b = static_cast<uint8_t>(idle_ >> (16 - 8 * i));
+        cycle[i] = opened_.lsbFirst ? Reverse8(b) : b;
+    }
+    for (auto& buf : buffers_) {
+        auto* dst = static_cast<uint8_t*>(buf[index & 1]);
+        for (uint32_t i = 0; i < bytesPerBuffer_; ++i) dst[i] = cycle[(idlePhase_ + i) % 3];
+    }
+    idlePhase_ = (idlePhase_ + bytesPerBuffer_) % 3;
 }
 
 double AsioDsdOutput::MeasuredSwitchSec() const {
@@ -565,6 +587,9 @@ void AsioDsdOutput::RequestReset(const std::wstring& reason) {
 
 void AsioDsdOutput::OnSwitch(long index) {
     const int64_t now = Qpc();
+    if (const int64_t prev = lastSwitchQpc_.load(std::memory_order_relaxed);
+        prev && double(now - prev) > 1.5 * opened_.bufferSamples / opened_.dsdRate * qpcFreq_)
+        stalls_.fetch_add(1, std::memory_order_relaxed);
     if (!firstSwitchQpc_.load(std::memory_order_relaxed)) firstSwitchQpc_.store(now, std::memory_order_relaxed);
     lastSwitchQpc_.store(now, std::memory_order_relaxed);
     timedSwitches_.fetch_add(1, std::memory_order_relaxed);

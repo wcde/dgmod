@@ -378,6 +378,11 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
                                                std::max<uint32_t>(bufferFrames_, 17) - 1);
             fadeInPos_ = fadeFrames_;
             holdPcm_.assign(size_t(fadeFrames_) * channels_, 0.0f);
+            // Silence with the edge rate of this stream (a kept stream may still idle on the one of the session before).
+            const uint32_t idle = dsd_.IdlePattern();
+            const uint64_t idle48 = (uint64_t{idle} << 24) | idle;
+            for (int i = 0; i < 3; ++i) idleWords_[i] = static_cast<uint16_t>(idle48 >> (32 - 16 * i));
+            asio_.SetIdlePattern(idle);
             asioEpoch_ = asio_.Epoch();
         }
     }
@@ -610,7 +615,7 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     base_.asioDsdMask = mask;
     if (!opened) return std::unexpected(opened.error());
     const AsioDsdOutput::Opened& o = *opened;
-    asioBase_ = {asio_.LateSwitches(), asio_.MissingEmergencies(), asio_.Resyncs(), asio_.Overloads()};
+    asioBase_ = {asio_.LateSwitches(), asio_.MissingEmergencies(), asio_.Resyncs(), asio_.Overloads(), asio_.Stalls()};
     native_ = true;
     dop_ = false;
     deviceChannels_ = o.deviceChannels;
@@ -930,7 +935,9 @@ void BridgeEngine::RenderThread() {
                           [this] { dsd_.Process(modPcm_.data(), fadeFrames_, dsdWords_.data()); });
         jobs.spare.emplace(L"dgmod bridge dsd spare", [this] {
             dsdSpare_.Process(emergencyPcm_.data(), spareTail_, emergencyWords_.data());
-            std::fill(emergencyWords_.begin() + size_t(spareTail_) * channels_, emergencyWords_.end(), uint16_t{0x6969});
+            for (uint32_t f = spareTail_; f < bufferFrames_; ++f)
+                for (uint32_t c = 0; c < channels_; ++c)
+                    emergencyWords_[size_t(f) * channels_ + c] = idleWords_[(f - spareTail_) % 3];
             asio_.SetEmergency(spareSeq_, emergencyWords_.data(), channels_);
         });
         headJob_ = &*jobs.head;
@@ -1100,7 +1107,8 @@ void BridgeEngine::LogGlitches() {
                              native_ ? asio_.LateSwitches() - asioBase_.lateSwitches : 0,
                              native_ ? asio_.MissingEmergencies() - asioBase_.missingEmergencies : 0,
                              native_ ? asio_.Resyncs() - asioBase_.resyncs : 0,
-                             native_ ? asio_.Overloads() - asioBase_.overloads : 0};
+                             native_ ? asio_.Overloads() - asioBase_.overloads : 0,
+                             native_ ? asio_.Stalls() - asioBase_.stalls : 0};
     auto delta = [](const wchar_t* name, uint64_t a, uint64_t b) {
         return a > b ? std::format(L" {} +{}", name, a - b) : std::wstring();
     };
@@ -1114,7 +1122,8 @@ void BridgeEngine::LogGlitches() {
                         delta(L"ASIO buffers missed", now.lateSwitches, logged_.lateSwitches) +
                         delta(L"of them without a fade-out", now.missingEmergencies, logged_.missingEmergencies) +
                         delta(L"ASIO driver resyncs", now.asioResyncs, logged_.asioResyncs) +
-                        delta(L"ASIO driver overloads", now.asioOverloads, logged_.asioOverloads);
+                        delta(L"ASIO driver overloads", now.asioOverloads, logged_.asioOverloads) +
+                        delta(L"ASIO driver stalls", now.asioStalls, logged_.asioStalls);
     if (what.empty()) return;
     logged_ = now;
     Log(std::format(L"glitch:{} (longest wake-up gap {:.1f} ms, period {:.1f} ms, fifo {:.1f} ms)", what,

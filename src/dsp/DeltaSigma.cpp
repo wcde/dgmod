@@ -969,6 +969,16 @@ const FixedEdgeShape* DsdEncoder::FixedEdgeShapeUsed() const {
     return fixedEdge_.empty() ? nullptr : &fixedEdge_[0].Shape();
 }
 
+uint32_t DsdEncoder::IdlePattern() const {
+    const FixedEdgeShape* fe = FixedEdgeShapeUsed();
+    if (!fe || fe->cell == 0 || 24 % fe->cell != 0) return 0x696969u;
+    const uint32_t ones = fe->cell / 2;
+    const uint32_t cellBits = ((1u << ones) - 1) << (fe->cell - ones);  // a run of ones, then of zeros
+    uint32_t p = 0;
+    for (uint32_t i = 0; i < 24; i += fe->cell) p = (p << fe->cell) | cellBits;
+    return p;
+}
+
 bool DsdEncoder::FixedEdgeAvx512() const { return !fixedEdge_.empty() && fixedEdge_[0].UsesAvx512(); }
 
 void DsdEncoder::AllowAvx512(bool allow) {

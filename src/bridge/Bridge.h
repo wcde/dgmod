@@ -123,6 +123,7 @@ private:
     dsp::DsdEncoder dsdSpare_;
     std::vector<float> holdPcm_, modPcm_, emergencyPcm_;
     std::vector<uint16_t> emergencyWords_;
+    uint16_t idleWords_[3]{0x6969, 0x6969, 0x6969};  // dsd_.IdlePattern() as a 48-bit cycle of words
     // Worker threads of the render thread (alive while it runs): the head of each period, and the emergency fade-out
     // of the period queued last (spareSeq_, spareTail_ frames).
     DsdJobThread* headJob_ = nullptr;
@@ -166,11 +167,11 @@ private:
     // Last counter values reported to the log (main thread).
     struct GlitchSnapshot {
         uint64_t underruns = 0, resyncs = 0, overruns = 0, discontinuities = 0, modulatorResets = 0, late = 0, slow = 0;
-        uint64_t badSamples = 0, lateSwitches = 0, missingEmergencies = 0, asioResyncs = 0, asioOverloads = 0;
+        uint64_t badSamples = 0, lateSwitches = 0, missingEmergencies = 0, asioResyncs = 0, asioOverloads = 0, asioStalls = 0;
     } logged_;
     // ASIO counters when the session took the stream (it may have been kept running from the session before).
     struct AsioCounters {
-        uint64_t lateSwitches = 0, missingEmergencies = 0, resyncs = 0, overloads = 0;
+        uint64_t lateSwitches = 0, missingEmergencies = 0, resyncs = 0, overloads = 0, stalls = 0;
     } asioBase_;
     uint64_t sessionMaxWakeGap_ = 0;
     void LogGlitches();

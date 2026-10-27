@@ -77,7 +77,10 @@ public:
     // (Info() describes it) instead of re-opening the driver, so the DAC never loses its input.
     [[nodiscard]] bool Running(const Request& request) const;
     [[nodiscard]] const Opened& Info() const { return opened_; }
-    // Starts the stream (no-op if it runs).
+    // DSD silence played when nothing is queued: 24 bits, the earliest in bit 23 (dsp::DsdEncoder::IdlePattern; 0x69
+    // until set). Any thread.
+    void SetIdlePattern(uint32_t pattern);
+    // Starts the stream (no-op if it runs); both buffer halves start with the idle pattern.
     Result<void> Start();
     // Stops the stream and unloads the driver (safe to call at any time).
     void Close();
@@ -111,6 +114,8 @@ public:
     [[nodiscard]] std::wstring ResetReason() const;
     // kAsioResyncRequest messages: the driver lost the stream (USB dropout, clock slip) and resynchronized.
     [[nodiscard]] uint64_t Resyncs() const { return resyncs_.load(std::memory_order_relaxed); }
+    // Buffer switches more than 1.5 buffers after the one before: the driver itself was late (its stream glitched).
+    [[nodiscard]] uint64_t Stalls() const { return stalls_.load(std::memory_order_relaxed); }
     // Buffer switches that found no queued buffer after playback had begun (covered by a fade-out to silence).
     [[nodiscard]] uint64_t LateSwitches() const { return late_.load(std::memory_order_relaxed); }
     // Of those, the ones whose emergency continuation was not attached yet (cut to DSD silence).
@@ -146,7 +151,8 @@ private:
     Opened opened_{};
     std::vector<std::array<void*, 2>> buffers_;
     uint32_t bytesPerBuffer_ = 0;
-    uint8_t silence_ = 0x69;
+    uint32_t idle_ = 0x696969;  // SetIdlePattern
+    uint32_t idlePhase_ = 0;    // next byte of the 3-byte idle cycle
 
     // The queue: slots head_ - 1 .. tail_ are pushed and waiting; slot tail_ - 1 was played last and keeps its
     // emergency continuation, so the producer never reuses it (one slot more than the depth plus that one).
@@ -161,7 +167,7 @@ private:
     std::atomic<uint64_t> epoch_{0};
 
     UniqueHandle switchEvent_, resetEvent_;
-    std::atomic<uint64_t> switchSeq_{0}, late_{0}, missing_{0}, overloads_{0}, resyncs_{0};
+    std::atomic<uint64_t> switchSeq_{0}, late_{0}, missing_{0}, overloads_{0}, resyncs_{0}, stalls_{0};
     std::atomic<int64_t> firstSwitchQpc_{0}, lastSwitchQpc_{0};
     std::atomic<uint64_t> timedSwitches_{0};
     double qpcFreq_ = 1;
