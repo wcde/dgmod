@@ -8,7 +8,8 @@
 //                             open that driver in native DSD mode, play 3 s of modulated DSD silence the way the bridge
 //                             renders (1 s of the driver's static silence first) and check that its buffer switches
 //                             match the declared buffer size and none is missed (the bridge must be stopped);
-//                             --tone plays 6 s of 1 / 1.5 kHz at -20 dBFS instead; --asio-probe --verbose lists
+//                             --tone plays 6 s of 1 / 1.5 kHz at -20 dBFS instead; --seconds N plays N s (a
+//                             listening test of the driver and the DAC alone); --asio-probe --verbose lists
 //                             channels and clocks
 //   dgmod-bridge.exe --scan-plugin <path>
 //                             list the effect classes of a VST 3 / VST 2 plug-in file (run by the GUI for every file)
@@ -168,8 +169,13 @@ int AsioTest(const std::vector<std::wstring>& args) {
             if (::WaitForMultipleObjects(2, h, FALSE, 2000) != WAIT_OBJECT_0 + 1) break;
         }
     });
-    ::Sleep(tone ? 6000 : 3000);
+    // --seconds N: play that long (a listening test: only the driver and the DAC, none of the bridge's processing).
+    uint32_t seconds = tone ? 6 : 3;
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == L"--seconds") seconds = std::max(1, _wtoi(args[i + 1].c_str()));
+    ::Sleep(seconds * 1000);
     const uint64_t late = out.LateSwitches();  // before the queue runs out on purpose
+    const uint64_t stalls = out.Stalls(), resyncs = out.Resyncs();
     ::SetEvent(quit.Get());
     render.join();
     ::Sleep(200);  // switches after the queue ran out: the callback fades out and writes silence itself
@@ -182,8 +188,10 @@ int AsioTest(const std::vector<std::wstring>& args) {
                       measuredMs <= 0 ? L"TOO FEW SWITCHES"
                       : !timing       ? L"MISMATCH (buffer size is not in DSD samples)"
                                       : L"OK"));
-    Print(std::format(L"{} periods rendered, {} missed, {} driver overload(s), modulator resets {}: {}", rendered, late,
-                      overloads, encoder.Resets(), late == 0 && rendered > 0 ? L"OK" : L"MISSED BUFFERS"));
+    Print(std::format(L"{} periods rendered, {} missed, {} driver overload(s), {} driver stall(s), {} driver resync(s), "
+                      L"modulator resets {}: {}",
+                      rendered, late, overloads, stalls, resyncs, encoder.Resets(),
+                      late == 0 && rendered > 0 ? L"OK" : L"MISSED BUFFERS"));
     return timing && late == 0 && rendered > 0 ? 0 : 2;
 }
 
