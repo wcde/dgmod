@@ -1,6 +1,7 @@
 #include "app/Pages.h"
 
 #include "bridge/SlipCopier.h"
+#include "common/NetProtocol.h"
 #include "dsp/FixedEdge.h"
 
 #include <shellapi.h>
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cwctype>
 #include <format>
 #include <utility>
 #include <vector>
@@ -238,7 +240,8 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
         PageHeader(ui, r, L"Bridge", L"Oversampling of everything Windows plays: virtual cable → dgmod → DAC in exclusive mode");
     {
         Rect a = actions;
-        const bool configured = !m.bridge.sourceId.empty() && !m.bridge.outputId.empty();
+        const bool configured =
+            !m.bridge.sourceId.empty() && (m.bridge.Network() ? !m.bridge.networkHost.empty() : !m.bridge.outputId.empty());
         if (ui.Button(ui.MakeId(L"bridge-start"), CutRight(a, 130.f, 8.f), running ? L"Stop" : L"Start",
                       running ? ButtonKind::Standard : ButtonKind::Accent, running ? glyph::Stop : glyph::Play,
                       running || configured)) {
@@ -247,7 +250,8 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
         }
         // A/B switch: the DAC gets the source audio untouched at the source rate.
         if (ui.Button(ui.MakeId(L"bridge-bypass"), CutRight(a, 130.f, 8.f), m.bridge.bypass ? L"Bypass on" : L"Bypass",
-                      m.bridge.bypass ? ButtonKind::Accent : ButtonKind::Standard, glyph::Switch, running)) {
+                      m.bridge.bypass ? ButtonKind::Accent : ButtonKind::Standard, glyph::Switch,
+                      running && !m.bridge.Network())) {
             m.bridge.bypass = !m.bridge.bypass;
             m.BridgeEdited();
         }
@@ -277,7 +281,12 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
         Notice(ui, r, Severity::Warning, L"Turn the volume down before the first DSD start",
                L"DSD reaches the DAC as DoP: 16 DSD bits and a marker in every 24-bit PCM sample. A DAC that recognises "
                L"the markers switches to DSD (its display shows DSD); one that does not plays them as loud noise.");
-    if (m.bridge.NativeDsd() && !m.demo && m.asioDrivers.empty())
+    if (m.bridge.Network() && !(running && st.nativeDsd == 2 && st.state == BridgeState::Playing))
+        Notice(ui, r, Severity::Info, L"Native DSD over the network",
+               L"The bit stream goes to dgmod-receiver (for example a Raspberry Pi with the DAC on its USB port), which "
+               L"plays it as raw DSD through ALSA. The DAC sets the pace: the receiver reports what it has played and the "
+               L"bridge follows its clock. Keep the volume low for the first start with a new DAC.");
+    else if (m.bridge.NativeDsd() && !m.demo && m.asioDrivers.empty())
         Notice(ui, r, Severity::Critical, L"No ASIO driver is installed",
                L"Native DSD goes to the DAC through the ASIO driver of its maker (for example the FiiO USB DAC driver). "
                L"Install it, or use DSD (DoP).");
@@ -353,7 +362,7 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
                  !running || !st.outRate ? std::wstring(L"not running")
                  : st.bypass             ? std::format(L"bypass · bit-exact · {}-bit · {} ch", st.outValidBits, st.channels)
                  : st.dop       ? std::format(L"DoP {}{} · {}", RateText(st.outRate), lookAhead, shape)
-                 : st.nativeDsd ? std::format(L"native · ASIO{} · {}", lookAhead, shape)
+                 : st.nativeDsd ? std::format(L"native · {}{} · {}", st.nativeDsd == 2 ? L"network" : L"ASIO", lookAhead, shape)
                           : std::format(L"{}-bit · {} taps · {}", st.outValidBits,
                                         st.interpTaps ? std::format(L"{}+{}", st.taps, st.interpTaps) : std::format(L"{}", st.taps),
                                         shape),
@@ -394,7 +403,7 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
         edited |= DeviceCombo(ui, ui.MakeId(L"bridge-source"), c, m, m.bridge.sourceId, m.bridge.outputId,
                               m.bridge.sourceName, L"not available");
     }
-    {
+    if (!m.bridge.Network()) {
         const Rect c = SettingRow(ui, r, L"Output",
                                   m.bridge.NativeDsd() ? L"Your DAC; native DSD reaches it through its ASIO driver"
                                                        : L"Your DAC; opened in exclusive mode",
@@ -409,15 +418,28 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
         }
     }
     {
-        const Rect c = SettingRow(ui, r, L"Output", L"Oversampled PCM, or DSD from dgmod's own delta-sigma modulator", 360.f);
-        static const std::wstring kModes[] = {L"PCM", L"DSD (DoP)", L"DSD (native)"};
+        const Rect c = SettingRow(ui, r, L"Output",
+                                  L"Oversampled PCM, or DSD from dgmod's modulator: DoP, ASIO or a network receiver",
+                                  420.f);
+        static const std::wstring kModes[] = {L"PCM", L"DSD (DoP)", L"DSD (native)", L"Network"};
         int mode = static_cast<int>(m.bridge.outputMode);
         if (ui.Segmented(ui.MakeId(L"bridge-mode"), c, kModes, mode)) {
             m.bridge.outputMode = static_cast<OutputMode>(mode);
             edited = true;
         }
     }
-    if (m.bridge.NativeDsd()) {
+    if (m.bridge.Network()) {
+        const Rect c = SettingRow(ui, r, L"Receiver", L"IP address or name of dgmod-receiver; host:port for another port", 360.f);
+        std::wstring host = m.bridge.networkHost;
+        if (ui.TextBox(ui.MakeId(L"bridge-network-host"), c, host, std::format(L"for example 192.168.1.50 (port {})", net::kDefaultPort))) {
+            std::erase_if(host, [](wchar_t ch) { return std::iswspace(ch) != 0; });
+            if (host != m.bridge.networkHost) {
+                m.bridge.networkHost = host;
+                edited = true;
+            }
+        }
+    }
+    if (m.bridge.NativeDsd() && !m.bridge.Network()) {
         const Rect c = SettingRow(ui, r, L"ASIO driver", L"The DAC maker's driver; it must support native DSD", 360.f);
         const AsioDriverEntry* matched = FindAsioDriver(m.asioDrivers, L"", [&] {
             const RenderEndpoint* out = m.FindRenderDevice(m.bridge.outputId);
@@ -442,9 +464,12 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
         }
     }
     if (m.bridge.NativeDsd()) {
-        const Rect c = SettingRow(ui, r, L"DSD rate", L"Bit rate of the modulator, sent to the ASIO driver as raw DSD", 360.f);
-        const AsioDriverEntry* driver = m.NativeDsdDriver();
-        const bool known = driver && m.asioDsdMask && driver->name == m.asioMaskDriver;
+        const Rect c = SettingRow(ui, r, L"DSD rate",
+                                  m.bridge.Network() ? L"Bit rate of the modulator, sent to the receiver as raw DSD"
+                                                     : L"Bit rate of the modulator, sent to the ASIO driver as raw DSD",
+                                  360.f);
+        const std::wstring target = m.NativeDsdTarget();
+        const bool known = !target.empty() && m.asioDsdMask && target == m.asioMaskDriver;
         auto offered = [&](uint32_t mult) { return !known || (m.asioDsdMask & DsdMaskBit(mult)) != 0; };
         uint32_t highest = 0;
         for (const uint32_t mult : kNativeDsdMultiples)
@@ -457,7 +482,9 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
             const uint32_t mult = kChoices[i];
             labels.push_back(std::format(L"DSD{} · {:.4g} MHz{}{}", mult, 44100.0 * mult / 1e6,
                                          mult > kNativeDsdAutoMax ? L" · high CPU load" : L"",
-                                         offered(mult) ? L"" : L" · not offered by the driver"));
+                                         offered(mult)        ? L""
+                                         : m.bridge.Network() ? L" · not offered by the receiver"
+                                                              : L" · not offered by the driver"));
             if (m.bridge.dsdMultiple == mult) index = static_cast<int>(i) + 1;
         }
         if (ui.Combo(ui.MakeId(L"bridge-native-rate"), c, labels, index)) {
@@ -579,12 +606,15 @@ void Bridge(Ui& ui, Rect area, AppModel& m) {
     }
     {
         const Rect c = SettingRow(ui, r, L"Output period",
-                                  m.bridge.NativeDsd()
+                                  m.bridge.Network()
+                                      ? L"Size of the buffers sent to the receiver; longer rides out system stalls"
+                                  : m.bridge.NativeDsd()
                                       ? L"ASIO buffer size; longer rides out system stalls (the driver rounds to its sizes)"
                                       : L"Device period in exclusive mode; longer rides out system stalls, adds latency",
                                   320.f);
         static constexpr uint32_t kPeriods[] = {5, 10, 20, 40, 80};
-        std::vector<std::wstring> labels{m.bridge.NativeDsd() ? L"Automatic (driver setting)"
+        std::vector<std::wstring> labels{m.bridge.Network()     ? L"Automatic (5 ms)"
+                                         : m.bridge.NativeDsd() ? L"Automatic (driver setting)"
                                          : m.bridge.Dop()     ? L"Automatic (10 ms)"
                                                               : L"Automatic (5 ms)"};
         int index = 0;

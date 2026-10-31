@@ -3,7 +3,7 @@
 // Command line:
 //   --status                           print the bridge status and the playback devices
 //   --render-page <all|bridge|filter|tone|plugins|devices|log> [--out dir] [--demo] [--width 1280] [--height 840]
-//                 [--output-mode pcm|dop|native]   (demo: the Bridge page in that output mode)
+//                 [--output-mode pcm|dop|native|network] [--host addr]   (demo: the Bridge page in that output mode)
 //                 [--response sharp|gaussian|slow|nos] [--design kaiser|equiripple] [--apodizing] [--phase linear|
 //                 intermediate|minimum]            (demo: the Filter page with that filter)
 //   --smoke <seconds> [--out dir] [--demo]  open the real window on another virtual desktop, cycle pages, capture them
@@ -87,6 +87,9 @@ int PrintStatus() {
         if (m.bridgeRunning) {
             Print(std::format(L"        {}{}{}, limiter {} (min gain {:.2f} dB, {} frames limited), clipped={}{}",
                               b.dop         ? std::format(L"DoP DSD{}", b.dsdRate / 44100)
+                              : b.nativeDsd == 2 ? std::format(L"native DSD{} to {} ({} samples/buffer, {} missed)",
+                                                               b.dsdRate / 44100, b.asioDriver, b.asioBufferSamples,
+                                                               b.lateSwitches)
                               : b.nativeDsd ? std::format(L"native DSD{} via ASIO \"{}\" ({} samples/buffer, switch {:.3f} ms, "
                                                           L"{} missed)",
                                                           b.dsdRate / 44100, b.asioDriver, b.asioBufferSamples, b.asioSwitchMs,
@@ -164,6 +167,8 @@ int RenderPages(const Args& args) {
         const std::wstring mode = args.Value(L"--output-mode");
         if (mode == L"dop") m.bridge.outputMode = OutputMode::Dop;
         else if (mode == L"native") m.bridge.outputMode = OutputMode::DsdNative;
+        else if (mode == L"network") m.bridge.outputMode = OutputMode::DsdNetwork;
+        if (args.Has(L"--host")) m.bridge.networkHost = args.Value(L"--host");
         const std::wstring response = args.Value(L"--response"), design = args.Value(L"--design"), phase = args.Value(L"--phase");
         if (response == L"gaussian") m.bridge.filterResponse = dsp::FilterResponse::Gaussian;
         else if (response == L"slow") m.bridge.filterResponse = dsp::FilterResponse::Slow;

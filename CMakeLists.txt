@@ -61,10 +61,11 @@ add_dependencies(dgmod dgmod-bridge)
 
 # --- dgmod-bridge.exe: virtual cable -> ASRC oversampler -> DAC in exclusive mode (PCM, DoP) or native DSD (ASIO) ---
 add_library(dgmod_bridge_core STATIC src/bridge/Bridge.cpp src/bridge/Bridge.h src/bridge/AsioOutput.cpp
-                                     src/bridge/AsioOutput.h src/bridge/SampleWriter.cpp
+                                     src/bridge/AsioOutput.h src/bridge/NetworkLink.cpp src/bridge/NetworkLink.h
+                                     src/bridge/SampleWriter.cpp
                                      src/bridge/SampleWriter.h src/bridge/FrameFifo.h src/bridge/DriftController.h
                                      src/bridge/Declicker.h src/bridge/LevelGuard.h src/bridge/SlipCopier.h)
-target_link_libraries(dgmod_bridge_core PUBLIC dgmod_common dgmod_dsp dgmod_plugins ole32 avrt propsys user32)
+target_link_libraries(dgmod_bridge_core PUBLIC dgmod_common dgmod_dsp dgmod_plugins ole32 avrt propsys user32 ws2_32)
 
 # --- VST 3 / VST 2 hosting (plug-in chain of the bridge, editor windows, scanner) ---
 file(GLOB DGMOD_PLUGIN_SOURCES CONFIGURE_DEPENDS src/plugins/*.cpp src/plugins/*.h)

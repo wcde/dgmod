@@ -25,8 +25,8 @@ settings will hardly change the sound.
 
 ## Features
 
-- **Output**: PCM up to 768 kHz (16/24/32-bit with TPDF dither), DSD64–256 over DoP, or native DSD64–1024 through
-  the DAC's ASIO driver.
+- **Output**: PCM up to 768 kHz (16/24/32-bit with TPDF dither), DSD64–256 over DoP, native DSD64–1024 through
+  the DAC's ASIO driver, or native DSD over the network to a Raspberry Pi (or any Linux box) with the DAC on USB.
 - **Filters**: quality presets up to 150 dB stop-band attenuation; linear, minimum or intermediate phase; sharp,
   Gaussian (ringing about ten times shorter), slow or NOS roll-off; optional apodizing; Kaiser or equiripple
   (Parks-McClellan) design.
@@ -54,6 +54,29 @@ settings will hardly change the sound.
 
 Exclusive mode skips any effects installed on the DAC. If you use Equalizer APO or similar, install it on the virtual
 device instead — it will then run before oversampling.
+
+## Network output (Raspberry Pi)
+
+With *Output → Network* the bridge sends the raw DSD stream over TCP to `dgmod-receiver`, a small Linux program that
+plays it through ALSA (`DSD_U32_BE` and the other native DSD formats of `snd-usb-audio`). The DAC is then
+electrically separated from the PC by the network. The DAC's clock sets the pace: the receiver reports what is still
+queued after every ALSA period (2 ms) and the bridge hands over a buffer only when there is room, so its drift control
+follows the DAC exactly as with ASIO. About 15–25 ms are added to the latency.
+
+On the Pi (Raspberry Pi OS):
+
+```sh
+sudo apt install build-essential cmake libasound2-dev
+cmake -S receiver -B build-receiver && cmake --build build-receiver
+./build-receiver/dgmod-receiver --list          # the DAC must show DSD rates here
+sudo install build-receiver/dgmod-receiver /usr/local/bin/
+sudo install -m 644 receiver/dgmod-receiver.service /etc/systemd/system/
+sudo systemctl enable --now dgmod-receiver
+```
+
+Then enter the Pi's address on the **Bridge** page under *Receiver*. Options of the receiver: `--device hw:CARD=...`,
+`--port` (default 47300), `--period-ms`, `--buffer-ms`, `--hold` (seconds of DSD silence kept after the bridge
+stopped, so a restart does not make the DAC re-lock). It logs to the journal: `journalctl -u dgmod-receiver -f`.
 
 ## How it works
 

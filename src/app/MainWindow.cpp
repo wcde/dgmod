@@ -391,6 +391,10 @@ LRESULT MainWindow::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             input_.keys.push_back(static_cast<unsigned>(wp));
             Invalidate();
             return 0;
+        case WM_CHAR:
+            input_.chars.push_back(static_cast<wchar_t>(wp));
+            Invalidate();
+            return 0;
         case WM_SETCURSOR:
             if (LOWORD(lp) == HTCLIENT) {
                 ::SetCursor(::LoadCursorW(nullptr, ui_.Cursor() ? ui_.Cursor() : IDC_ARROW));

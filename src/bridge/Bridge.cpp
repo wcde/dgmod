@@ -237,8 +237,8 @@ void BridgeEngine::Run(HANDLE stopEvent, HANDLE reloadEvent, BridgeStatusMapping
             if (w == WAIT_OBJECT_0) break;
         }
         BridgeConfig next = LoadBridgeConfig();
-        if (!(next.NativeDsd() && next.asioDriver == cfg.asioDriver && next.dsdMultiple == cfg.dsdMultiple &&
-              next.periodMs == cfg.periodMs))
+        if (!(next.NativeDsd() && next.Network() == cfg.Network() && next.asioDriver == cfg.asioDriver &&
+              next.networkHost == cfg.networkHost && next.dsdMultiple == cfg.dsdMultiple && next.periodMs == cfg.periodMs))
             asioTimingError_.clear();  // another driver, rate or buffer: native DSD may be tried again
         cfg = std::move(next);
     }
@@ -286,8 +286,13 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
         Log(L"waiting: " + why);
         return SessionEnd::Retry;
     };
-    if (cfg.sourceId.empty() || cfg.outputId.empty()) return wait(L"Choose the source (virtual) and output devices");
-    if (cfg.sourceId == cfg.outputId) return wait(L"Source and output must be different devices");
+    if (cfg.Network()) {
+        if (cfg.sourceId.empty()) return wait(L"Choose the source (virtual) device");
+        if (cfg.networkHost.empty()) return wait(L"Enter the address of the network receiver (dgmod-receiver)");
+    } else {
+        if (cfg.sourceId.empty() || cfg.outputId.empty()) return wait(L"Choose the source (virtual) and output devices");
+        if (cfg.sourceId == cfg.outputId) return wait(L"Source and output must be different devices");
+    }
     if (FAILED(::CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator_))))
         return wait(L"MMDeviceEnumerator unavailable");
 
@@ -307,8 +312,9 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
         return wait(r.error().Message());
     }
 
-    if (cfg.sourceName != base_.sourceName || cfg.outputName != base_.outputName)
-        SaveBridgeDeviceNames(base_.sourceName, base_.outputName);
+    // (Network: base_.outputName names the receiver's DAC, not the output endpoint.)
+    if (cfg.sourceName != base_.sourceName || (!cfg.Network() && cfg.outputName != base_.outputName))
+        SaveBridgeDeviceNames(base_.sourceName, cfg.Network() ? cfg.outputName : std::wstring(base_.outputName));
 
     // DSP: the oversampling ASRC, or the bit-exact pass-through when bypassed at the source rate.
     bypass_ = cfg.bypass && outRate_ == inRate_;
@@ -392,7 +398,7 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
     base_.channels = channels_;
     base_.bypass = bypass_ ? 1u : 0u;
     base_.dop = dop_ ? 1u : 0u;
-    base_.nativeDsd = native_ ? 1u : 0u;
+    base_.nativeDsd = native_ ? (asio_.Network() ? 2u : 1u) : 0u;
     base_.dsdRate = Dsd() ? dsd_.DsdRate() : 0u;
     base_.dsdNoiseBandHz = Dsd() ? dsd_.NoiseBandHz() : 0.0;
     base_.dsdLookAheadPaths = Dsd() ? dsd_.LookAheadUsed().paths : 0u;
@@ -445,7 +451,8 @@ BridgeEngine::SessionEnd BridgeEngine::RunSession(const BridgeConfig& cfg, HANDL
                            dop_ ? L"DoP" : L"native", dsd_.DsdRate() / 44100, dsd_.DsdRate(), dsd_.Ntf().order, search,
                            fallback, dsd_.NoiseBandHz() / 1000.0, std::lround(dsdScale_ * 100.0f));
     }
-    if (native_) dsp += std::format(L" via ASIO \"{}\"", base_.asioDriver);
+    if (native_) dsp += asio_.Network() ? std::format(L" to {} ({})", base_.asioDriver, asio_.Info().driverName)
+                                        : std::format(L" via ASIO \"{}\"", base_.asioDriver);
     Log(std::format(L"session: {} ({} Hz, {} ch) -> {} ({} Hz, {}/{} bit, {} frames/period), {}, target {:.1f} ms",
                     base_.sourceName, inRate_, captureChannels_, base_.outputName, outRate_, base_.outValidBits,
                     base_.outBits, bufferFrames_, dsp, base_.targetMs));
@@ -622,28 +629,37 @@ void BridgeEngine::PublishOutputFormats(const BridgeConfig& cfg) {
 Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     // The WASAPI endpoint stays closed (the ASIO driver talks to the DAC); it still names the DAC for re-binding and
     // for finding its driver, and its formats are published for the PCM and DoP choices in the UI.
-    std::wstring endpointName = cfg.outputName;
-    if (ComPtr<IMMDevice> dev; SUCCEEDED(enumerator_->GetDevice(cfg.outputId.c_str(), &dev))) {
-        DWORD state = 0;
-        dev->GetState(&state);
-        if (state == DEVICE_STATE_ACTIVE) {
-            endpointName = DeviceName(dev.Get());
-            PublishOutputFormats(cfg);
-        }
-    }
-    CopyText(base_.outputName, endpointName);
-    const auto drivers = ListAsioDrivers();
-    const AsioDriverEntry* driver = FindAsioDriver(drivers, cfg.asioDriver, endpointName);
-    if (!driver)
-        return dgmod::Fail(E_FAIL, drivers.empty() ? std::wstring(L"No ASIO driver is installed: native DSD needs the DAC maker's "
-                                                                   L"ASIO driver")
-                                    : cfg.asioDriver.empty()
-                                        ? std::format(L"No ASIO driver matches \"{}\": choose the DAC's driver", endpointName)
-                                        : std::format(L"The ASIO driver \"{}\" is not installed", cfg.asioDriver));
-    CopyText(base_.asioDriver, driver->name);
+    // Network: the receiver plays the part of the driver; the output device is not used.
     AsioDsdOutput::Request req;
-    req.clsid = driver->clsid;
-    req.name = driver->name;
+    std::wstring target;
+    if (cfg.Network()) {
+        target = NetworkTargetName(cfg.networkHost);
+        req.network = cfg.networkHost;
+        req.name = target;
+    } else {
+        std::wstring endpointName = cfg.outputName;
+        if (ComPtr<IMMDevice> dev; SUCCEEDED(enumerator_->GetDevice(cfg.outputId.c_str(), &dev))) {
+            DWORD state = 0;
+            dev->GetState(&state);
+            if (state == DEVICE_STATE_ACTIVE) {
+                endpointName = DeviceName(dev.Get());
+                PublishOutputFormats(cfg);
+            }
+        }
+        CopyText(base_.outputName, endpointName);
+        const auto drivers = ListAsioDrivers();
+        const AsioDriverEntry* driver = FindAsioDriver(drivers, cfg.asioDriver, endpointName);
+        if (!driver)
+            return dgmod::Fail(E_FAIL, drivers.empty() ? std::wstring(L"No ASIO driver is installed: native DSD needs the DAC "
+                                                                       L"maker's ASIO driver")
+                                        : cfg.asioDriver.empty()
+                                            ? std::format(L"No ASIO driver matches \"{}\": choose the DAC's driver", endpointName)
+                                            : std::format(L"The ASIO driver \"{}\" is not installed", cfg.asioDriver));
+        target = driver->name;
+        req.clsid = driver->clsid;
+        req.name = driver->name;
+    }
+    CopyText(base_.asioDriver, target);
     req.dsdMultiple = cfg.dsdMultiple;
     req.channels = captureChannels_;
     // Automatic: the driver's own buffer setting. The render thread keeps AsioDsdOutput::QueueDepth() buffers queued
@@ -658,6 +674,7 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     base_.asioDsdMask = mask;
     if (!opened) return std::unexpected(opened.error());
     const AsioDsdOutput::Opened& o = *opened;
+    if (o.network) CopyText(base_.outputName, o.driverName);
     if (!kept) {
         monitor_.Reset(o.channels, o.bufferSamples / 8, o.dsdRate, o.lsbFirst);
         tapNext_ = 0;
@@ -678,9 +695,19 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
     // emergency fade-out.
     base_.deviceLatencyMs = std::max(0.0, o.outputLatencyMs - base_.periodMs) +
                             (asio_.QueueDepth() - 1) * base_.periodMs + std::min(double(kDeclickMs), base_.periodMs);
+    if (o.network) {
+        Log(std::format(L"network: {}receiver {} ({}), DSD{} native, {} of {} channels, {} samples/buffer ({:.2f} ms, {} queued "
+                        L"ahead), {:.1f} ms in flight{}, accepts{}{}{}{}{}",
+                        kept ? L"kept running " : L"", cfg.networkHost, o.driverName, o.dsdMultiple, o.channels,
+                        o.deviceChannels, o.bufferSamples, base_.periodMs, asio_.QueueDepth(), o.outputLatencyMs,
+                        o.kept ? L" (its DAC kept running)" : L"", (mask & DsdMaskBit(64)) ? L" DSD64" : L"",
+                        (mask & DsdMaskBit(128)) ? L" DSD128" : L"", (mask & DsdMaskBit(256)) ? L" DSD256" : L"",
+                        (mask & DsdMaskBit(512)) ? L" DSD512" : L"", (mask & DsdMaskBit(1024)) ? L" DSD1024" : L""));
+        return {};
+    }
     Log(std::format(L"asio: {}\"{}\" ({}), DSD{} native, {} of {} outputs, {} samples/buffer ({:.2f} ms, {} queued ahead), {}, "
                     L"output latency {:.2f} ms, outputReady {}, accepts{}{}{}{}{}",
-                    kept ? L"kept running " : L"", driver->name, o.driverName, o.dsdMultiple, o.channels, o.deviceChannels, o.bufferSamples, base_.periodMs,
+                    kept ? L"kept running " : L"", target, o.driverName, o.dsdMultiple, o.channels, o.deviceChannels, o.bufferSamples, base_.periodMs,
                     asio_.QueueDepth(),
                     o.lsbFirst ? L"LSB first" : L"MSB first", o.outputLatencyMs, o.outputReady ? L"yes" : L"no",
                     (mask & DsdMaskBit(64)) ? L" DSD64" : L"", (mask & DsdMaskBit(128)) ? L" DSD128" : L"",
@@ -690,7 +717,7 @@ Result<void> BridgeEngine::OpenAsio(const BridgeConfig& cfg) {
 }
 
 void BridgeEngine::CheckAsioTiming() {
-    if (asioChecked_) return;
+    if (asioChecked_ || asio_.Network()) return;  // the receiver paces the buffers by its own reports
     const double measured = asio_.MeasuredSwitchSec();
     if (measured <= 0) return;
     asioChecked_ = true;
@@ -710,7 +737,7 @@ void BridgeEngine::CheckAsioTiming() {
 Result<void> BridgeEngine::OpenRender(const BridgeConfig& cfg) {
     native_ = false;
     dop_ = false;
-    if (cfg.NativeDsd() && !cfg.bypass) return OpenAsio(cfg);
+    if (cfg.Network() || (cfg.NativeDsd() && !cfg.bypass)) return OpenAsio(cfg);  // the network has no PCM path
     StopCarry(nullptr);
     asio_.Close();  // a stream kept from a native DSD session holds the DAC
     ComPtr<IMMDevice> dev;
@@ -1161,6 +1188,7 @@ void BridgeEngine::LogGlitches() {
                              native_ ? asio_.Overloads() - asioBase_.overloads : 0,
                              native_ ? asio_.Stalls() - asioBase_.stalls : 0,
                              native_ ? asio_.Checked().violations - asioBase_.bitViolations : 0};
+    const bool net = native_ && asio_.Network();
     auto delta = [](const wchar_t* name, uint64_t a, uint64_t b) {
         return a > b ? std::format(L" {} +{}", name, a - b) : std::wstring();
     };
@@ -1171,11 +1199,11 @@ void BridgeEngine::LogGlitches() {
                         delta(L"late render wake-ups", now.late, logged_.late) +
                         delta(L"slow periods", now.slow, logged_.slow) +
                         delta(L"invalid samples replaced", now.badSamples, logged_.badSamples) +
-                        delta(L"ASIO buffers missed", now.lateSwitches, logged_.lateSwitches) +
+                        delta(net ? L"network buffers missed" : L"ASIO buffers missed", now.lateSwitches, logged_.lateSwitches) +
                         delta(L"of them without a fade-out", now.missingEmergencies, logged_.missingEmergencies) +
-                        delta(L"ASIO driver resyncs", now.asioResyncs, logged_.asioResyncs) +
-                        delta(L"ASIO driver overloads", now.asioOverloads, logged_.asioOverloads) +
-                        delta(L"ASIO driver stalls", now.asioStalls, logged_.asioStalls);
+                        delta(net ? L"receiver underruns" : L"ASIO driver resyncs", now.asioResyncs, logged_.asioResyncs) +
+                        delta(net ? L"receiver ALSA xruns" : L"ASIO driver overloads", now.asioOverloads, logged_.asioOverloads) +
+                        delta(net ? L"receiver report gaps" : L"ASIO driver stalls", now.asioStalls, logged_.asioStalls);
     if (now.bitViolations > logged_.bitViolations) {
         static constexpr const wchar_t* kSource[] = {L"a queued period", L"an emergency fade-out", L"idle silence"};
         const AsioDsdOutput::BitCheck b = asio_.Checked();

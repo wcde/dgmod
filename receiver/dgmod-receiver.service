@@ -1,0 +1,17 @@
+[Unit]
+Description=dgmod network DSD receiver
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/dgmod-receiver
+Restart=always
+RestartSec=2
+DynamicUser=yes
+SupplementaryGroups=audio
+# Real-time priority for the audio thread and locked memory without root.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

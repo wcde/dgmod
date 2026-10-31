@@ -299,7 +299,7 @@ uint32_t AppModel::PreviewDeviceRate() const {
         return bridgeStatus.outRate;
     if (bridge.NativeDsd()) {
         if (bridge.dsdMultiple) return DopFrameRate(bridge.dsdMultiple);
-        if (const AsioDriverEntry* d = NativeDsdDriver(); d && asioDsdMask && d->name == asioMaskDriver)
+        if (const std::wstring target = NativeDsdTarget(); !target.empty() && asioDsdMask && target == asioMaskDriver)
             for (const uint32_t m : kNativeDsdMultiples)
                 if (m <= kNativeDsdAutoMax && (asioDsdMask & DsdMaskBit(m))) return DopFrameRate(m);
         return DopFrameRate(256);
@@ -320,6 +320,12 @@ uint32_t AppModel::PreviewDeviceRate() const {
 const AsioDriverEntry* AppModel::NativeDsdDriver() const {
     const RenderEndpoint* out = FindRenderDevice(bridge.outputId);
     return FindAsioDriver(asioDrivers, bridge.asioDriver, out ? out->name : bridge.outputName);
+}
+
+std::wstring AppModel::NativeDsdTarget() const {
+    if (bridge.Network()) return bridge.networkHost.empty() ? std::wstring() : NetworkTargetName(bridge.networkHost);
+    const AsioDriverEntry* d = NativeDsdDriver();
+    return d ? d->name : std::wstring();
 }
 
 void AppModel::UpdatePreview() {

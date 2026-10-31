@@ -132,6 +132,17 @@ std::wstring DescribeDriver(D* d) {
 
 std::atomic<AsioDsdOutput*> g_active{nullptr};  // ASIO callbacks carry no context: one open driver per process
 
+// The requested DSD rate if `mask` has it; for 0 the highest up to kNativeDsdAutoMax (else the lowest above). 0: none.
+uint32_t ChooseDsdMultiple(uint32_t mask, uint32_t requested) {
+    for (const uint32_t m : kNativeDsdMultiples)
+        if ((mask & DsdMaskBit(m)) && (requested ? m == requested : m <= kNativeDsdAutoMax)) return m;
+    uint32_t chosen = 0;
+    if (!requested)  // only rates above the automatic limit
+        for (const uint32_t m : kNativeDsdMultiples)
+            if (mask & DsdMaskBit(m)) chosen = m;
+    return chosen;
+}
+
 }  // namespace
 
 // The IASIO interface (thiscall on x86, the only convention on x64).
@@ -257,6 +268,11 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
         std::lock_guard lock(reasonMutex_);
         resetReason_.clear();
     }
+    if (!req.network.empty()) {
+        auto result = OpenNetwork(req, supportedMask);
+        if (!result) Close();
+        return result;
+    }
     AsioDsdOutput* expected = nullptr;
     if (!g_active.compare_exchange_strong(expected, this))
         return dgmod::Fail(E_FAIL, L"Another ASIO driver is already open in this process");
@@ -300,16 +316,7 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
             if (driver_->canSampleRate(44100.0 * m) == ASE_OK) o.supportedMask |= DsdMaskBit(m);
         supportedMask = o.supportedMask;
         if (!o.supportedMask) return fail(L"The ASIO driver accepts no DSD rate in DSD mode");
-        for (const uint32_t m : kNativeDsdMultiples) {
-            if (!(o.supportedMask & DsdMaskBit(m))) continue;
-            if (req.dsdMultiple ? m == req.dsdMultiple : m <= kNativeDsdAutoMax) {
-                o.dsdMultiple = m;
-                break;
-            }
-        }
-        if (!o.dsdMultiple && !req.dsdMultiple)  // only rates above the automatic limit
-            for (const uint32_t m : kNativeDsdMultiples)
-                if (o.supportedMask & DsdMaskBit(m)) o.dsdMultiple = m;
+        o.dsdMultiple = ChooseDsdMultiple(o.supportedMask, req.dsdMultiple);
         if (!o.dsdMultiple) return fail(std::format(L"The ASIO driver does not accept DSD{} (native)", req.dsdMultiple));
         o.dsdRate = 44100u * o.dsdMultiple;
         if (driver_->setSampleRate(double(o.dsdRate)) != ASE_OK)
@@ -371,24 +378,7 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
             buffers_[c] = {infos[c].buffers[0], infos[c].buffers[1]};
         }
         bytesPerBuffer_ = o.bufferSamples / 8;
-        {
-            std::lock_guard lock(queueMutex_);
-            slots_.assign(size_t(kSlots) * 2 * bytesPerBuffer_ * o.channels, uint8_t{0x69});
-            idle_.assign(bytesPerBuffer_, o.lsbFirst ? Reverse8(0x69) : uint8_t{0x69});
-            endSeq_ = ~uint64_t{0};
-            rulesPending_ = false;
-        }
-        minRun_ = 1;
-        maxRun_ = 32;
-        checkReset_ = true;
-        checkedBuffers_ = violations_ = 0;
-        lastBadRun_ = lastBadSource_ = 0;
-        run_.assign(o.channels, 0);
-        runBit_.assign(o.channels, 0);
-        tap_.assign(size_t(kTapSlots) * bytesPerBuffer_ * o.channels, 0);
-        tapHead_ = 0;
-        FillSilence(0);
-        FillSilence(1);
+        InitBuffers();
         long inLatency = 0, outLatency = 0;
         if (driver_->getLatencies(&inLatency, &outLatency) == ASE_OK) o.outputLatencyMs = outLatency * 1000.0 / o.dsdRate;
         o.outputReady = driver_->outputReady() == ASE_OK;
@@ -399,9 +389,84 @@ Result<AsioDsdOutput::Opened> AsioDsdOutput::Open(const Request& req, uint32_t& 
     return result;
 }
 
+void AsioDsdOutput::InitBuffers() {
+    {
+        std::lock_guard lock(queueMutex_);
+        slots_.assign(size_t(kSlots) * 2 * bytesPerBuffer_ * opened_.channels, uint8_t{0x69});
+        idle_.assign(bytesPerBuffer_, opened_.lsbFirst ? Reverse8(0x69) : uint8_t{0x69});
+        endSeq_ = ~uint64_t{0};
+        rulesPending_ = false;
+    }
+    minRun_ = 1;
+    maxRun_ = 32;
+    checkReset_ = true;
+    checkedBuffers_ = violations_ = 0;
+    lastBadRun_ = lastBadSource_ = 0;
+    run_.assign(opened_.channels, 0);
+    runBit_.assign(opened_.channels, 0);
+    tap_.assign(size_t(kTapSlots) * bytesPerBuffer_ * opened_.channels, 0);
+    tapHead_ = 0;
+    FillSilence(0);
+    FillSilence(1);
+}
+
+Result<AsioDsdOutput::Opened> AsioDsdOutput::OpenNetwork(const Request& req, uint32_t& supportedMask) {
+    net_ = std::make_unique<NetworkLink>();
+    auto caps = net_->Connect(req.network, 3000, [this](const std::wstring& why) { RequestReset(why); });
+    if (!caps) return std::unexpected(caps.error());
+    Opened o;
+    o.network = true;
+    o.driverName = std::format(L"{} ({})", Widen(std::string(caps->device, strnlen(caps->device, sizeof(caps->device)))),
+                               Widen(std::string(caps->format, strnlen(caps->format, sizeof(caps->format)))));
+    uint32_t known = 0;
+    for (const uint32_t m : kNativeDsdMultiples) known |= DsdMaskBit(m);
+    o.supportedMask = supportedMask = caps->dsdMask & known;
+    if (!o.supportedMask) return dgmod::Fail(E_FAIL, std::format(L"The DAC of the receiver at {} accepts no native DSD rate", req.network));
+    if (!caps->maxChannels) return dgmod::Fail(E_FAIL, L"The receiver reports a DAC without channels");
+    o.deviceChannels = caps->maxChannels;
+    o.channels = std::clamp<uint32_t>(req.channels, 1, o.deviceChannels);
+    o.dsdMultiple = ChooseDsdMultiple(o.supportedMask, req.dsdMultiple);
+    if (!o.dsdMultiple) return dgmod::Fail(E_FAIL, std::format(L"The DAC of the receiver does not accept DSD{} (native)", req.dsdMultiple));
+    o.dsdRate = 44100u * o.dsdMultiple;
+    // Whole 64-bit groups per channel: every ALSA DSD format (8, 16 or 32 bits per sample) divides a buffer.
+    const double wantedMs = req.periodMs > 0 ? req.periodMs : kNetworkPeriodMs;
+    o.bufferSamples = std::max<uint32_t>(64, static_cast<uint32_t>(std::lround(o.dsdRate * wantedMs / 1000.0 / 64.0)) * 64);
+    o.frames = o.bufferSamples / 16;
+    bytesPerBuffer_ = o.bufferSamples / 8;
+    const double bufferMs = o.bufferSamples * 1000.0 / o.dsdRate;
+    depth_ = std::clamp<uint32_t>(static_cast<uint32_t>(std::ceil(kQueueSlackMs / bufferMs - 1e-9)), 1, kMaxQueueDepth);
+
+    netHalves_.assign(size_t(2) * o.channels * bytesPerBuffer_, uint8_t{0x69});
+    buffers_.assign(o.channels, {});
+    for (uint32_t c = 0; c < o.channels; ++c)
+        buffers_[c] = {netHalves_.data() + size_t(c) * bytesPerBuffer_,
+                       netHalves_.data() + size_t(o.channels + c) * bytesPerBuffer_};
+    opened_ = o;
+    InitBuffers();
+    net::Open open{o.dsdMultiple, o.channels, bytesPerBuffer_};
+    const size_t halfBytes = size_t(o.channels) * bytesPerBuffer_;
+    auto ready = net_->Open(open, [this, halfBytes](long half) {
+        OnSwitch(half);
+        return netHalves_.data() + (half & 1) * halfBytes;
+    });
+    if (!ready) return std::unexpected(ready.error());
+    const double bytesPerMs = o.dsdRate / 8000.0;
+    netTarget_ = uint64_t{ready->bufferBytes} + bytesPerBuffer_ + static_cast<uint64_t>(std::lround(kNetworkLeadMs * bytesPerMs));
+    o.outputLatencyMs = double(netTarget_) / bytesPerMs;
+    o.kept = ready->kept != 0;
+    buffersCreated_ = true;
+    opened_ = o;
+    request_ = req;
+    return o;
+}
+
 bool AsioDsdOutput::Running(const Request& req) const {
-    return sta_ && driver_ && buffersCreated_ && started_ && !ResetRequested() && ::IsEqualGUID(req.clsid, request_.clsid) &&
-           req.dsdMultiple == request_.dsdMultiple && req.channels == request_.channels && req.periodMs == request_.periodMs;
+    if (net_)
+        return buffersCreated_ && started_ && !net_->Failed() && !ResetRequested() && req.network == request_.network &&
+               req.dsdMultiple == request_.dsdMultiple && req.channels == request_.channels && req.periodMs == request_.periodMs;
+    return sta_ && driver_ && buffersCreated_ && started_ && !ResetRequested() && req.network.empty() &&
+           ::IsEqualGUID(req.clsid, request_.clsid) && req.dsdMultiple == request_.dsdMultiple &&
+           req.channels == request_.channels && req.periodMs == request_.periodMs;
 }
 
 bool AsioDsdOutput::ResetRequested() const {
@@ -409,6 +474,13 @@ bool AsioDsdOutput::ResetRequested() const {
 }
 
 Result<void> AsioDsdOutput::Start() {
+    if (net_) {
+        if (!buffersCreated_) return dgmod::Fail(E_UNEXPECTED, L"Network: not open");
+        if (net_->Failed()) return dgmod::Fail(E_FAIL, net_->Error());
+        if (!started_) net_->Start(netTarget_);  // the pump fills the halves itself
+        started_ = true;
+        return {};
+    }
     if (!sta_ || !driver_ || !buffersCreated_) return dgmod::Fail(E_UNEXPECTED, L"ASIO: not open");
     if (started_) return {};
     {
@@ -439,6 +511,11 @@ void AsioDsdOutput::Close() {
             window_ = nullptr;
         });
         sta_.reset();
+    }
+    if (net_) {
+        net_->Close();  // joins the pump: no buffer switch runs after this
+        net_.reset();
+        started_ = buffersCreated_ = false;
     }
     buffers_.clear();
     AsioDsdOutput* self = this;
@@ -561,6 +638,8 @@ void AsioDsdOutput::CopySlot(const uint8_t* src, long index) {
 void AsioDsdOutput::SetIdle(const uint16_t* idle, uint32_t minRun, uint32_t maxRun) {
     std::vector<uint8_t> packed(bytesPerBuffer_);
     PackDsdChannel(idle, opened_.frames, 1, 0, opened_.lsbFirst, packed.data());
+    // The receiver repeats it whenever its queue runs dry (and plays it until the first buffer arrives).
+    if (net_) net_->SendIdle(packed);
     std::lock_guard lock(queueMutex_);
     // Other rules or another silence: the stream changes its kind with the next buffer pushed. Until that one plays,
     // what plays belongs to the stream before (or is silence of the new kind): not checked; its join with the new

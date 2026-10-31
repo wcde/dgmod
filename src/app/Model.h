@@ -67,6 +67,8 @@ public:
     std::wstring asioMaskDriver;
     // ASIO driver native DSD would use now: the configured one, or the one matching the output device.
     [[nodiscard]] const AsioDriverEntry* NativeDsdDriver() const;
+    // Name the bridge publishes for the native DSD target in use now (driver name or NetworkTargetName); empty if none.
+    [[nodiscard]] std::wstring NativeDsdTarget() const;
     // Level history of the bridge for the live graphs (oldest first), refreshed every frame by PollBridgeMeter.
     struct LevelSample {
         double t = 0;             // seconds on the QPC clock

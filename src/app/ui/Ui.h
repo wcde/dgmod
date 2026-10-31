@@ -71,10 +71,12 @@ struct Input {
     float wheel = 0;
     bool ctrl = false, shift = false;
     std::vector<unsigned> keys;
+    std::wstring chars;  // WM_CHAR input of this frame
     void EndFrame() {
         pressed = released = doubleClick = rightReleased = false;
         wheel = 0;
         keys.clear();
+        chars.clear();
     }
     [[nodiscard]] bool KeyPressed(unsigned vk) const {
         for (unsigned k : keys)
@@ -241,6 +243,9 @@ public:
     bool Combo(Id id, Rect r, std::span<const std::wstring> items, int& selected, bool enabled = true);
     // Horizontal Fluent slider; `step` > 0 snaps the value. Returns true while the value changes.
     bool Slider(Id id, Rect r, float& value, float minValue, float maxValue, float step = 0.f, bool enabled = true);
+    // Single-line text field. Edits stay local until Enter or a click elsewhere commits them (Escape discards); returns
+    // true when a commit changed `value`.
+    bool TextBox(Id id, Rect r, std::wstring& value, std::wstring_view placeholder = {}, bool enabled = true);
     void Card(Rect r, float radius = 8.f);
     void Badge(Rect r, std::wstring_view text, Color fg, Color bg);
     float BadgeWidth(std::wstring_view text, float size = 12.f);
@@ -315,6 +320,10 @@ private:
 
     Id hot_ = 0;
     Id active_ = 0;
+    // TextBox being edited: its text and caret position.
+    Id focus_ = 0;
+    std::wstring editText_;
+    size_t caret_ = 0;
     std::unordered_map<Id, float> anims_;
     std::unordered_map<Id, bool> animsTouched_;
 

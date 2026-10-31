@@ -110,6 +110,100 @@ bool Ui::Slider(Id id, Rect r, float& value, float minValue, float maxValue, flo
     return changed;
 }
 
+bool Ui::TextBox(Id id, Rect r, std::wstring& value, std::wstring_view placeholder, bool enabled) {
+    constexpr size_t kMaxChars = 256;
+    const auto& t = *theme_;
+    const Interaction it = enabled ? Interact(id, r) : Interaction{};
+    if (it.hovered) SetCursor(IDC_IBEAM);
+    bool focused = focus_ == id;
+    bool commit = false;
+    if (enabled && in_->pressed && it.hovered && !focused) {
+        focus_ = id;
+        editText_ = value;
+        caret_ = editText_.size();
+        focused = true;
+    } else if (focused && (!enabled || (in_->pressed && !Hover(r)))) {
+        commit = true;  // a click elsewhere
+    }
+    auto insert = [&](std::wstring_view s) {
+        for (const wchar_t ch : s) {
+            if (ch == L'\r' || ch == L'\n') break;  // one line
+            if (ch < 32 || editText_.size() >= kMaxChars) continue;
+            editText_.insert(caret_++, 1, ch);
+        }
+    };
+    if (focused && !commit) {
+        for (const wchar_t ch : in_->chars) {
+            if (ch == L'\r') {
+                commit = true;
+                break;
+            }
+            if (ch == 27) {  // Escape
+                focus_ = 0;
+                focused = false;
+                break;
+            }
+            if (ch == 8) {  // Backspace
+                if (caret_) editText_.erase(--caret_, 1);
+            } else if (ch == 22) {  // Ctrl+V
+                if (::OpenClipboard(hwnd_)) {
+                    if (HANDLE data = ::GetClipboardData(CF_UNICODETEXT))
+                        if (const auto* text = static_cast<const wchar_t*>(::GlobalLock(data))) {
+                            insert(text);
+                            ::GlobalUnlock(data);
+                        }
+                    ::CloseClipboard();
+                }
+            } else {
+                insert(std::wstring_view(&ch, 1));
+            }
+        }
+        if (focused)
+            for (const unsigned vk : in_->keys) {
+                if (vk == VK_LEFT && caret_) --caret_;
+                else if (vk == VK_RIGHT && caret_ < editText_.size()) ++caret_;
+                else if (vk == VK_HOME) caret_ = 0;
+                else if (vk == VK_END) caret_ = editText_.size();
+                else if (vk == VK_DELETE && caret_ < editText_.size()) editText_.erase(caret_, 1);
+            }
+    }
+    bool changed = false;
+    if (commit && focused) {
+        focus_ = 0;
+        focused = false;
+        if (editText_ != value) {
+            value = editText_;
+            changed = true;
+        }
+    }
+
+    Fill(r, !enabled ? t.controlPressed : focused ? t.controlPressed : it.hovered ? t.controlHover : t.control, 4.f);
+    Stroke(r, t.controlStroke, 4.f);
+    if (focused) Fill({r.x + 1.f, r.B() - 2.f, r.w - 2.f, 2.f}, t.accent, 1.f);
+    else if (enabled) Line({r.x + 4.f, r.B() - 0.5f}, {r.R() - 4.f, r.B() - 0.5f}, t.controlStrokeBottom);
+    const std::wstring& shown = focused ? editText_ : value;
+    const Rect inner{r.x + 11.f, r.y, r.w - 22.f, r.h};
+    TextStyle st = Body(14.f);
+    if (!enabled) st.color = t.textDisabled;
+    PushClip(inner);
+    if (shown.empty() && !focused) {
+        TextStyle ph = st;
+        ph.color = t.textDisabled;
+        Text(inner, placeholder, ph);
+    } else {
+        // Keep the caret visible: shift long text left.
+        const float caretX = Measure(std::wstring_view(shown).substr(0, focused ? caret_ : 0), st).x;
+        const float shift = std::max(0.f, caretX - (inner.w - 4.f));
+        Text({inner.x - shift, inner.y, inner.w + shift, inner.h}, shown, st);
+        if (focused) {
+            const float x = inner.x - shift + caretX + 0.5f;
+            Line({x, r.y + 8.f}, {x, r.B() - 8.f}, t.text, 1.f);
+        }
+    }
+    PopClip();
+    return changed;
+}
+
 bool Ui::Segmented(Id id, Rect r, std::span<const std::wstring> items, int& selected, bool enabled) {
     if (items.empty()) return false;
     const auto& t = *theme_;

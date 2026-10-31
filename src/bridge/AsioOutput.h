@@ -15,7 +15,12 @@
 // plays the emergency continuation of the buffer it played last, then DSD silence, and advances the epoch: buffers the
 // render thread built for the old epoch no longer join seamlessly and are refused (Push returns false), so it restarts
 // the modulator and fades in. The DAC therefore never gets a replayed buffer or a cut in the bit stream.
+//
+// Network: with Request::network set, the buffers go to a dgmod-receiver (NetworkLink) instead of an ASIO driver. Its
+// pump thread plays the part of the driver's callback: it switches buffers whenever the receiver reports room for one
+// more, so the queue, the emergency continuations and the bit check work unchanged.
 
+#include "bridge/NetworkLink.h"
 #include "common/Win.h"
 
 #include <array>
@@ -40,6 +45,7 @@ public:
         uint32_t dsdMultiple = 0;   // 64..1024; 0 = highest accepted up to kNativeDsdAutoMax
         uint32_t channels = 2;      // outputs to use (clamped to the driver's)
         double periodMs = 0;        // wanted buffer duration; 0 = the driver's preferred size (its control panel)
+        std::wstring network;       // non-empty: address of a dgmod-receiver, used instead of the ASIO driver
     };
     struct Opened {
         uint32_t dsdMultiple = 0;
@@ -52,7 +58,9 @@ public:
         double outputLatencyMs = 0;   // reported by the driver (usually one buffer plus its own)
         bool lsbFirst = false;
         bool outputReady = false;     // the driver supports outputReady()
-        std::wstring driverName;      // as the driver names itself
+        std::wstring driverName;      // as the driver names itself (network: the receiver's card and ALSA format)
+        bool network = false;
+        bool kept = false;            // network: the receiver's DAC was already running in this format
     };
     // Result of Probe(): what the driver offers without creating buffers.
     struct Capabilities {
@@ -103,6 +111,10 @@ public:
     // for kQueueSlackMs of slack, at least one, at most kMaxQueueDepth.
     static constexpr uint32_t kMaxQueueDepth = 3;
     static constexpr double kQueueSlackMs = 20.0;
+    // Network: automatic buffer duration, and the margin kept queued in the receiver beyond its ALSA buffer and one
+    // buffer (covers network and scheduling jitter of the pump).
+    static constexpr double kNetworkPeriodMs = 5.0;
+    static constexpr double kNetworkLeadMs = 10.0;
     [[nodiscard]] uint32_t QueueDepth() const { return depth_; }
 
     // Render thread.
@@ -126,15 +138,22 @@ public:
     [[nodiscard]] HANDLE ResetEvent() const { return resetEvent_.Get(); }  // the driver asked to be re-opened
     [[nodiscard]] bool ResetRequested() const;
     [[nodiscard]] std::wstring ResetReason() const;
-    // kAsioResyncRequest messages: the driver lost the stream (USB dropout, clock slip) and resynchronized.
-    [[nodiscard]] uint64_t Resyncs() const { return resyncs_.load(std::memory_order_relaxed); }
+    // kAsioResyncRequest messages: the driver lost the stream (USB dropout, clock slip) and resynchronized. Network:
+    // periods the receiver's queue ran dry (it inserted DSD silence).
+    [[nodiscard]] uint64_t Resyncs() const {
+        return resyncs_.load(std::memory_order_relaxed) + (net_ ? net_->Underruns() : 0);
+    }
+    [[nodiscard]] bool Network() const { return net_ != nullptr; }
     // Buffer switches more than 1.5 buffers after the one before: the driver itself was late (its stream glitched).
     [[nodiscard]] uint64_t Stalls() const { return stalls_.load(std::memory_order_relaxed); }
     // Buffer switches that found no queued buffer after playback had begun (covered by a fade-out to silence).
     [[nodiscard]] uint64_t LateSwitches() const { return late_.load(std::memory_order_relaxed); }
     // Of those, the ones whose emergency continuation was not attached yet (cut to DSD silence).
     [[nodiscard]] uint64_t MissingEmergencies() const { return missing_.load(std::memory_order_relaxed); }
-    [[nodiscard]] uint64_t Overloads() const { return overloads_.load(std::memory_order_relaxed); }
+    // kAsioOverload messages. Network: ALSA under-runs in the receiver.
+    [[nodiscard]] uint64_t Overloads() const {
+        return overloads_.load(std::memory_order_relaxed) + (net_ ? net_->Xruns() : 0);
+    }
     // Mean interval of the buffer switches since Start (0 until enough were seen), in seconds.
     [[nodiscard]] double MeasuredSwitchSec() const;
     [[nodiscard]] uint64_t Switches() const { return switchSeq_.load(std::memory_order_relaxed); }
@@ -144,6 +163,9 @@ private:
     class StaThread;
 
     void OnSwitch(long index);
+    Result<Opened> OpenNetwork(const Request& request, uint32_t& supportedMask);
+    // Queue, idle silence, bit check and tap for the buffers of opened_ (buffers_ set).
+    void InitBuffers();
     long OnMessage(long selector, long value);
     void RequestReset(const std::wstring& reason);
     void FillSilence(long index);
@@ -167,6 +189,10 @@ private:
     std::vector<std::array<void*, 2>> buffers_;
     uint32_t bytesPerBuffer_ = 0;
     std::vector<uint8_t> idle_;  // one packed channel of idle silence (SetIdle), the same for every channel
+    // Network: the link and the two buffer halves (half-major, channel-planar: what a Data message carries).
+    std::unique_ptr<NetworkLink> net_;
+    std::vector<uint8_t> netHalves_;
+    uint64_t netTarget_ = 0;  // bytes per channel kept in flight
 
     // The queue: slots head_ - 1 .. tail_ are pushed and waiting; slot tail_ - 1 was played last and keeps its
     // emergency continuation, so the producer never reuses it (one slot more than the depth plus that one).

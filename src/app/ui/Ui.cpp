@@ -168,7 +168,7 @@ void Ui::End() {
     if (!tipSeen_) tipId_ = 0;
     // State changed by input is only visible in the next frame (immediate mode): always render one more.
     if (in_->pressed || in_->released || in_->doubleClick || in_->rightReleased || in_->wheel != 0 ||
-        !in_->keys.empty())
+        !in_->keys.empty() || !in_->chars.empty())
         wantFrame_ = true;
 }
 

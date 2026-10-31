@@ -31,7 +31,10 @@ void BridgeConfig::Validate() {
     if (static_cast<uint32_t>(filterPhase) > 2) filterPhase = dsp::FilterPhase::Linear;
     if (static_cast<uint32_t>(filterResponse) > 3) filterResponse = dsp::FilterResponse::Sharp;
     if (static_cast<uint32_t>(filterDesign) > 1) filterDesign = dsp::FilterDesign::Kaiser;
-    if (outputMode != OutputMode::Dop && outputMode != OutputMode::DsdNative) outputMode = OutputMode::Pcm;
+    if (outputMode != OutputMode::Dop && outputMode != OutputMode::DsdNative && outputMode != OutputMode::DsdNetwork)
+        outputMode = OutputMode::Pcm;
+    std::erase_if(networkHost, [](wchar_t ch) { return std::iswspace(ch) != 0; });
+    if (networkHost.size() > 253) networkHost.clear();
     const std::span<const uint32_t> rates =
         NativeDsd() ? std::span<const uint32_t>(kNativeDsdMultiples) : std::span<const uint32_t>(kDsdMultiples);
     if (std::find(rates.begin(), rates.end(), dsdMultiple) == rates.end()) dsdMultiple = 0;
@@ -68,6 +71,7 @@ BridgeConfig LoadBridgeConfig() {
     if (auto v = reg::ReadDword(k, L"DsdLookAhead")) c.dsdLookAhead = static_cast<dsp::LookAhead>(*v);
     if (auto v = reg::ReadDword(k, L"DsdModulator")) c.dsdModulator = static_cast<dsp::DsdModulator>(*v);
     if (auto v = reg::ReadString(k, L"AsioDriver")) c.asioDriver = *v;
+    if (auto v = reg::ReadString(k, L"NetworkHost")) c.networkHost = *v;
     if (auto v = reg::ReadDword(k, L"BufferMs")) c.bufferMs = *v;
     if (auto v = reg::ReadDword(k, L"PeriodMs")) c.periodMs = *v;
     if (auto v = reg::ReadDword(k, L"Dither")) c.dither = *v != 0;
@@ -116,6 +120,7 @@ HRESULT SaveBridgeConfig(const BridgeConfig& in) {
     dword(L"DsdLookAhead", static_cast<DWORD>(c.dsdLookAhead));
     dword(L"DsdModulator", static_cast<DWORD>(c.dsdModulator));
     str(L"AsioDriver", c.asioDriver);
+    str(L"NetworkHost", c.networkHost);
     dword(L"BufferMs", c.bufferMs);
     dword(L"PeriodMs", c.periodMs);
     dword(L"Dither", c.dither ? 1u : 0u);

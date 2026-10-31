@@ -25,7 +25,8 @@ inline constexpr wchar_t kBridgeStatusMappingPrefix[] = L"Local\\dgmod.Bridge.St
 // PCM: oversampled PCM at the output rate. DoP: DSD made by dgmod's own delta-sigma modulator, sent as DSD over PCM
 // (DoP v1.1) so the DAC's interpolation filter and modulator are bypassed. DsdNative: the same DSD stream sent as raw
 // bits through the DAC's ASIO driver (no DoP markers; higher rates than DoP fits into the PCM formats of WASAPI).
-enum class OutputMode : uint32_t { Pcm = 0, Dop = 1, DsdNative = 2 };
+// DsdNetwork: the same raw DSD stream sent over the network to dgmod-receiver (a Raspberry Pi with the DAC on USB).
+enum class OutputMode : uint32_t { Pcm = 0, Dop = 1, DsdNative = 2, DsdNetwork = 3 };
 
 // DoP frame rate (PCM rate carrying the DSD stream) for DSD64/128/256; the DSD bit rate is 16 times higher. The DSP
 // chain runs at this rate for native DSD too (the modulator turns every frame into one 16-bit word per channel).
@@ -62,6 +63,7 @@ struct BridgeConfig {
     dsp::LookAhead dsdLookAhead = dsp::LookAhead::Off;  // DSD: pruned tree search of the modulator (up to DSD256)
     dsp::DsdModulator dsdModulator = dsp::DsdModulator::DeltaSigma;  // DSD: fixed-edge at DSD256 only (50 % level)
     std::wstring asioDriver;         // native DSD: ASIO driver name; empty = the one matching the output device
+    std::wstring networkHost;        // network DSD: receiver address, "host" or "host:port"
     uint32_t bufferMs = 20;          // FIFO target between capture and render (latency vs. robustness)
     uint32_t periodMs = 0;           // output period; 0 = automatic (5 ms or the device minimum, DoP 10 ms, ASIO: the
                                      // driver's buffer setting)
@@ -77,7 +79,9 @@ struct BridgeConfig {
         return dsp::ShapeSpec(dsp::SpecFor(quality, custom), filterPhase, apodizing, filterResponse, filterDesign);
     }
     [[nodiscard]] bool Dop() const { return outputMode == OutputMode::Dop; }
-    [[nodiscard]] bool NativeDsd() const { return outputMode == OutputMode::DsdNative; }
+    // Raw DSD bits, through ASIO or over the network (the same render path).
+    [[nodiscard]] bool NativeDsd() const { return outputMode == OutputMode::DsdNative || Network(); }
+    [[nodiscard]] bool Network() const { return outputMode == OutputMode::DsdNetwork; }
     [[nodiscard]] bool Dsd() const { return Dop() || NativeDsd(); }
     void Validate();
     friend bool operator==(const BridgeConfig&, const BridgeConfig&) = default;
@@ -90,6 +94,9 @@ HRESULT SaveBridgePreviousDefault(const std::wstring& id);
 HRESULT SaveBridgeBypass(bool bypass);
 HRESULT SaveBridgeDeviceNames(const std::wstring& sourceName, const std::wstring& outputName);
 HRESULT SaveBridgeDeviceIds(const std::wstring& sourceId, const std::wstring& outputId);
+
+// Name the bridge publishes as its native DSD target (BridgeStatusData::asioDriver) for a network receiver.
+inline std::wstring NetworkTargetName(const std::wstring& host) { return L"Network " + host; }
 
 // Endpoint name without the instance number Windows adds to duplicates: "Speakers (2- FiiO K9)" -> "Speakers (FiiO K9)".
 std::wstring NormalizeEndpointName(std::wstring_view name);
